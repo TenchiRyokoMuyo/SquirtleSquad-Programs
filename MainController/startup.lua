@@ -1,4 +1,4 @@
--- TurtleTeamNet Main Controller startup.lua v12 Compact Jobs
+-- TurtleTeamNet Main Controller startup.lua v14 Hardened NetLoop
 -- Compact job storage: never prebuild/save block lists or torch tables.
 
 local PROTOCOL = "TurtleTeamNet"
@@ -242,34 +242,70 @@ end
 
 local function netLoop()
   while true do
-    local sender,msg=rednet.receive(PROTOCOL,0.5)
-    if type(msg)=="table" and type(msg.type)=="string" then
-      if msg.type=="REGISTER" then
-        local tbl = (msg.role=="miner") and state.miners or ((msg.role=="foreman") and state.foremen or nil)
+    local ok, err = pcall(function()
+      local sender, msg = rednet.receive(PROTOCOL, 0.5)
+
+      -- rednet.receive times out with msg=nil. Never touch msg.type unless msg is a table.
+      if type(msg) ~= "table" then return end
+      if type(msg.type) ~= "string" then return end
+
+      if msg.type == "REGISTER" then
+        local tbl = (msg.role == "miner") and state.miners or ((msg.role == "foreman") and state.foremen or nil)
         if tbl then
-          tbl[tostring(sender)]={id=sender,role=msg.role,status=msg.status or "LISTENING",gps=msg.gps,lastSeen=os.clock(),gpsStatus=msg.gpsStatus}
-          rednet.send(sender,{type="REGISTER_ACK",controller=HOSTNAME},PROTOCOL)
+          tbl[tostring(sender)] = {
+            id = sender,
+            role = msg.role,
+            status = msg.status or "LISTENING",
+            gps = msg.gps,
+            gpsStatus = msg.gpsStatus,
+            lastSeen = os.clock(),
+          }
+          rednet.send(sender, { type = "REGISTER_ACK", controller = HOSTNAME }, PROTOCOL)
         end
-      elseif msg.type=="HEARTBEAT" then
-        local tbl = (msg.role=="miner") and state.miners or ((msg.role=="foreman") and state.foremen or nil)
+
+      elseif msg.type == "HEARTBEAT" then
+        local tbl = (msg.role == "miner") and state.miners or ((msg.role == "foreman") and state.foremen or nil)
         if tbl then
-          local rec=tbl[tostring(sender)] or {}
-          for k,v in pairs(msg) do rec[k]=v end
-          rec.lastSeen=os.clock(); rec.id=sender; tbl[tostring(sender)]=rec
+          local rec = tbl[tostring(sender)] or { id = sender, role = msg.role }
+          for k, v in pairs(msg) do rec[k] = v end
+          rec.lastSeen = os.clock()
+          rec.id = sender
+          tbl[tostring(sender)] = rec
         end
-      elseif msg.type=="GPS_PONG" then
-        state.gpsHosts[tostring(sender)]={id=sender,role=msg.role,x=msg.x,y=msg.y,z=msg.z,lastSeen=os.clock()}
-      elseif msg.type=="REQUEST_ASSIGNMENT" then
+
+      elseif msg.type == "GPS_PONG" then
+        state.gpsHosts[tostring(sender)] = {
+          id = sender, role = msg.role, x = msg.x, y = msg.y, z = msg.z, lastSeen = os.clock()
+        }
+
+      elseif msg.type == "REQUEST_ASSIGNMENT" then
         assignJobs()
-      elseif msg.type=="SECTOR_COMPLETE" then
-        log("Sector complete from "..tostring(sender))
-      elseif msg.type=="ERROR" then
-        log("ERROR from "..tostring(sender)..": "..tostring(msg.error))
+
+      elseif msg.type == "ROLL_CALL_RESPONSE" then
+        local tbl = (msg.role == "miner") and state.miners or ((msg.role == "foreman") and state.foremen or nil)
+        if tbl then
+          local rec = tbl[tostring(sender)] or { id = sender, role = msg.role }
+          for k, v in pairs(msg) do rec[k] = v end
+          rec.lastSeen = os.clock()
+          rec.id = sender
+          tbl[tostring(sender)] = rec
+        end
+
+      elseif msg.type == "SECTOR_COMPLETE" then
+        log("Sector complete from " .. tostring(sender))
+
+      elseif msg.type == "ERROR" then
+        log("ERROR from " .. tostring(sender) .. ": " .. tostring(msg.error))
       end
+    end)
+
+    if not ok then
+      log("NetLoop error recovered: " .. tostring(err))
+      sleep(0.25)
     end
-    dashboard()
   end
 end
+
 local function periodic()
   while true do rednet.broadcast({type="ROLL_CALL"},PROTOCOL); rednet.broadcast({type="GPS_PING"},PROTOCOL); assignJobs(); saveAll(); dashboard(); sleep(8) end
 end
