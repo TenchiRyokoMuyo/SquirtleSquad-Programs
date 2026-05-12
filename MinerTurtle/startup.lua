@@ -1,56 +1,101 @@
--- Miner Turtle startup.lua v11
--- No Ctrl+T lockout. GPS is diagnostic/correction only; failure does not abort listening.
-local PROTOCOL="TurtleTeamNet"; local STATE_FILE="miner_state.dat"; local role="miner"; local id=os.getComputerID()
-local modemSide,controllerId
-local state={role=role,status="IDLE",job=nil,sector=nil,currentIndex=1,progress=0,lastKnownGPS=nil,gpsStatus="untested",error=nil,facing=nil,pos=nil}
+-- TurtleTeamNet Miner Turtle startup.lua v12 Compact Jobs
+-- No Ctrl+T lockout. Computes shape positions on demand; no huge point tables.
+
+local PROTOCOL="TurtleTeamNet"
+local STATE_FILE="miner_state.dat"
+local role="miner"
+local id=os.getComputerID()
+local modemSide=nil
+local controllerId=nil
+local state={role=role,status="LISTENING",job=nil,sector=nil,currentIndex=1,gpsStatus="unknown",lastGPS=nil,error=nil}
+local facing=0 -- 0 north(-z),1 east(+x),2 south(+z),3 west(-x)
+local pos=nil
+
 local function save() local f=fs.open(STATE_FILE,"w"); if f then f.write(textutils.serialize(state)); f.close() end end
 local function load() if fs.exists(STATE_FILE) then local f=fs.open(STATE_FILE,"r"); local s=f.readAll(); f.close(); local t=textutils.unserialize(s); if type(t)=="table" then for k,v in pairs(t) do state[k]=v end end end end
 local function findModem() for _,side in ipairs(peripheral.getNames()) do if peripheral.getType(side)=="modem" then return side end end end
-local function gpsTry(timeout) local x,y,z=gps.locate(timeout or 3); if x then state.lastKnownGPS={x=math.floor(x+0.5),y=math.floor(y+0.5),z=math.floor(z+0.5)}; state.pos={x=state.lastKnownGPS.x,y=state.lastKnownGPS.y,z=state.lastKnownGPS.z}; state.gpsStatus="ok"; save(); return state.lastKnownGPS end state.gpsStatus="unavailable"; save(); return nil end
-local function draw(msg) term.clear(); term.setCursorPos(1,1); print("Miner Turtle #"..id); print("Status: "..tostring(state.status)); print("Controller: "..tostring(controllerId)); if state.job then print("Job: "..state.job.id.." Sector: "..(state.sector and state.sector.id or "?")); print("Index: "..state.currentIndex.." Progress: "..state.progress.."%") end; print("GPS: "..tostring(state.gpsStatus)); if msg then print(msg) end; if state.error then print("ERROR: "..state.error) end end
+local function gpsTry(timeout) local x,y,z=gps.locate(timeout or 2); if x then state.gpsStatus="ok"; state.lastGPS={x=math.floor(x+0.5),y=math.floor(y+0.5),z=math.floor(z+0.5)}; pos={x=state.lastGPS.x,y=state.lastGPS.y,z=state.lastGPS.z}; return pos end state.gpsStatus="unavailable"; return nil end
 local function send(msg) if controllerId then rednet.send(controllerId,msg,PROTOCOL) else rednet.broadcast(msg,PROTOCOL) end end
-local function register() rednet.broadcast({type="REGISTER",role=role,id=id,status=state.status,gps=state.lastKnownGPS,gpsStatus=state.gpsStatus},PROTOCOL) end
-local function heartbeat() send({type="HEARTBEAT",role=role,id=id,status=state.status,fuel=turtle.getFuelLevel(),gps=state.lastKnownGPS,gpsStatus=state.gpsStatus,jobId=state.job and state.job.id,sectorId=state.sector and state.sector.id,currentIndex=state.currentIndex,progress=state.progress}) end
-local protectedSubstrings={"chest","barrel","shulker","drawer","computer","turtle","modem","scaffold","create:"}
-local function isProtected(name) if not name then return false end; for _,s in ipairs(protectedSubstrings) do if name:lower():find(s,1,true) then return true end end; return false end
-local function inspectForward() local ok,d=turtle.inspect(); return ok,d end
-local function safeDigForward() local ok,d=inspectForward(); if ok then local n=d.name or ""; if isProtected(n) then state.status="ERROR"; state.error="Protected block ahead: "..n; save(); send({type="ERROR",role=role,id=id,error=state.error}); return false end; turtle.dig() end; return true end
-local function safeDigUp() local ok,d=turtle.inspectUp(); if ok then local n=d.name or ""; if isProtected(n) then state.status="ERROR"; state.error="Protected block above: "..n; save(); send({type="ERROR",role=role,id=id,error=state.error}); return false end; turtle.digUp() end; return true end
-local function safeDigDown() if state.job and state.job.origin and state.pos and state.pos.y <= state.job.origin.y then return true end; local ok,d=turtle.inspectDown(); if ok then local n=d.name or ""; if isProtected(n) then state.status="ERROR"; state.error="Protected block below: "..n; save(); send({type="ERROR",role=role,id=id,error=state.error}); return false end; turtle.digDown() end; return true end
-local dirs={{x=0,z=-1,name="N"},{x=1,z=0,name="E"},{x=0,z=1,name="S"},{x=-1,z=0,name="W"}}
-local function turnLeft() turtle.turnLeft(); if state.facing then state.facing=((state.facing+2)%4)+1 end end
-local function turnRight() turtle.turnRight(); if state.facing then state.facing=(state.facing%4)+1 end end
-local function face(idx) if not state.facing then state.facing=1 end; while state.facing~=idx do turnRight() end end
-local function forward() if not safeDigForward() then return false end; if turtle.forward() then if state.pos and state.facing then local d=dirs[state.facing]; state.pos.x=state.pos.x+d.x; state.pos.z=state.pos.z+d.z end; save(); return true end; return false end
-local function up() if not safeDigUp() then return false end; if turtle.up() then if state.pos then state.pos.y=state.pos.y+1 end; save(); return true end; return false end
-local function down() if state.job and state.job.origin and state.pos and state.pos.y <= state.job.origin.y then return false end; if not safeDigDown() then return false end; if turtle.down() then if state.pos then state.pos.y=state.pos.y-1 end; save(); return true end; return false end
-local function moveAxisX(tx) while state.pos and state.pos.x~=tx do face(tx>state.pos.x and 2 or 4); if not forward() then return false end end; return true end
-local function moveAxisZ(tz) while state.pos and state.pos.z~=tz do face(tz>state.pos.z and 3 or 1); if not forward() then return false end end; return true end
-local function moveAxisY(ty) while state.pos and state.pos.y~=ty do if ty>state.pos.y then if not up() then return false end else if not down() then return false end end end; return true end
-local function gotoPoint(p) if not state.pos then state.pos={x=p.x,y=p.y,z=p.z} end; return moveAxisY(p.y) and moveAxisX(p.x) and moveAxisZ(p.z) end
-local function organizeInventory() -- best effort: slot 16 torches, slot 1 fuel, slot 2 filler
-  for i=1,16 do local d=turtle.getItemDetail(i); if d and d.name and d.name:find("torch") and i~=16 then turtle.select(i); turtle.transferTo(16) end end
-  turtle.select(1)
+local function status(extra) term.clear(); term.setCursorPos(1,1); print("Miner Turtle #"..id); print("Status: "..tostring(state.status)); print("Controller: "..tostring(controllerId)); print("GPS: "..tostring(state.gpsStatus)); if state.job then print("Job: "..state.job.id.." "..state.job.shape); print("Sector: "..(state.sector and state.sector.id or "?")); print("Index: "..tostring(state.currentIndex).." / "..tostring(state.sector and state.sector.totalEstimate or state.job.totalEstimate or "?")) end; if state.error then print("ERROR: "..state.error) end; if extra then print(extra) end end
+local function register() send({type="REGISTER",role=role,id=id,status=state.status,gps=gpsTry(1),gpsStatus=state.gpsStatus}) end
+local function heartbeat() send({type="HEARTBEAT",role=role,id=id,status=state.status,fuel=turtle.getFuelLevel(),gps=state.lastGPS,gpsStatus=state.gpsStatus,jobId=state.job and state.job.id,sectorId=state.sector and state.sector.id,currentIndex=state.currentIndex}) end
+
+local fuelNames={ ["minecraft:coal"]=true,["minecraft:charcoal"]=true,["minecraft:coal_block"]=true,["minecraft:lava_bucket"]=true }
+local function organizeInventory()
+  for i=1,16 do local d=turtle.getItemDetail(i); if d and fuelNames[d.name] and i~=1 then turtle.select(i); turtle.transferTo(1) end end
+  for i=1,16 do local d=turtle.getItemDetail(i); if d and d.name:find("torch") and i~=16 then turtle.select(i); turtle.transferTo(16) end end
+  if turtle.getItemCount(2)==0 then for i=3,15 do local d=turtle.getItemDetail(i); if d and not fuelNames[d.name] and not d.name:find("torch") then turtle.select(i); turtle.transferTo(2); break end end end
+  turtle.select(1); if turtle.getFuelLevel() < 200 and turtle.getItemCount(1)>0 then turtle.refuel(math.min(16,turtle.getItemCount(1))) end
 end
-local function assign(msg) state.job=msg.job; state.sector=msg.sector; state.currentIndex=state.currentIndex or 1; state.status="MINING"; state.error=nil; save(); send({type="MINER_SAFE",jobId=state.job.id,sectorId=state.sector.id}); end
+local protectedSubstrings={"chest","barrel","shulker","drawer","computer","turtle","modem","monitor","disk_drive","scaffold","scaffolding","spawner","create:"}
+local function protected(name) if not name then return false end; for _,s in ipairs(protectedSubstrings) do if name:find(s) then return true end end; return false end
+local function inspectDir(dir) if dir=="up" then return turtle.inspectUp() elseif dir=="down" then return turtle.inspectDown() else return turtle.inspect() end end
+local function digDir(dir)
+  local ok,d=inspectDir(dir); if ok and d and protected(d.name) then state.status="ERROR"; state.error="Protected block: "..d.name; save(); send({type="ERROR",role=role,id=id,error=state.error}); return false end
+  if dir=="up" then return turtle.digUp() elseif dir=="down" then return turtle.digDown() else return turtle.dig() end
+end
+local function updateForward() if not pos then return end; if facing==0 then pos.z=pos.z-1 elseif facing==1 then pos.x=pos.x+1 elseif facing==2 then pos.z=pos.z+1 else pos.x=pos.x-1 end end
+local function turnLeft() turtle.turnLeft(); facing=(facing+3)%4 end
+local function turnRight() turtle.turnRight(); facing=(facing+1)%4 end
+local function face(f) while facing~=f do turnRight() end end
+local function forward()
+  for i=1,3 do if turtle.forward() then updateForward(); return true end; if not digDir("forward") then return false end; sleep(0.2) end
+  return false
+end
+local function up() for i=1,3 do if turtle.up() then if pos then pos.y=pos.y+1 end; return true end; if not digDir("up") then return false end; sleep(0.2) end; return false end
+local function down(minY) if pos and pos.y<=minY then return false end; for i=1,3 do if turtle.down() then if pos then pos.y=pos.y-1 end; return true end; if not digDir("down") then return false end; sleep(0.2) end; return false end
+local function gotoXYZ(target)
+  local minY=state.job.origin.y
+  if not pos then pos={x=target.x,y=target.y,z=target.z}; return true end
+  while pos.y < target.y do if not up() then return false end end
+  while pos.x ~= target.x do face(pos.x < target.x and 1 or 3); if not forward() then return false end end
+  while pos.z ~= target.z do face(pos.z < target.z and 2 or 0); if not forward() then return false end end
+  while pos.y > target.y do if not down(minY) then return false end end
+  return true
+end
+
+local function inside(shape,p,x,y,z)
+  if shape=="rectangular_prism" then return x>=0 and x<p.sideA and z>=0 and z<p.sideB and y>=0 and y<p.height end
+  if shape=="cylinder" then return y>=0 and y<p.height and x*x+z*z <= p.radius*p.radius end
+  if shape=="dome" then return y>=0 and y<=p.radius and x*x+z*z+y*y <= p.radius*p.radius end
+  if shape=="pyramid" then if y<0 or y>=p.height then return false end; local k=1-y/p.height; return math.abs(x)<=p.sideA*k/2 and math.abs(z)<=p.sideB*k/2 end
+  if shape=="cone" then if y<0 or y>=p.height then return false end; local r=p.radius*(1-y/p.height); return x*x+z*z<=r*r end
+  return true
+end
+local function indexToPoint(job, sector, idx)
+  local p=job.params or {}; local o=job.origin
+  local y0=sector.yStart or 0; local y1=sector.yEnd or ((p.height or p.radius or 1)-1)
+  local count=0
+  if job.shape=="rectangular_prism" then
+    for y=y0,y1 do for z=0,(p.sideB or 1)-1 do for x=0,(p.sideA or 1)-1 do count=count+1; if count==idx then return {x=o.x+x,y=o.y+y,z=o.z+z} end end end end
+  elseif job.shape=="cylinder" or job.shape=="dome" or job.shape=="cone" or job.shape=="pyramid" then
+    local r=math.max(p.radius or p.sideA or 1, p.sideB or p.radius or 1)
+    for y=y0,y1 do for z=-r,r do for x=-r,r do if inside(job.shape,p,x,y,z) then count=count+1; if count==idx then return {x=o.x+x,y=o.y+y,z=o.z+z} end end end end end
+  elseif job.shape=="tunnel" or job.shape=="tunnel_spline" or job.shape=="stretched_cylinder" then
+    local x2,y2,z2=p.x2 or o.x,p.y2 or o.y,p.z2 or o.z; local len=math.max(1,p.length or 1); local width=p.width or (p.radius and p.radius*2+1) or 3; local rad=math.floor(width/2)
+    for step=0,len do local t=step/len; local cx=math.floor(o.x+(x2-o.x)*t+0.5); local cy=math.floor(o.y+(y2-o.y)*t+0.5); local cz=math.floor(o.z+(z2-o.z)*t+0.5); for yy=-rad,rad do for zz=-rad,rad do for xx=-rad,rad do if xx*xx+yy*yy+zz*zz<=rad*rad then count=count+1; if count==idx then return {x=cx+xx,y=cy+yy,z=cz+zz} end end end end end end
+  end
+  return nil
+end
+local function shouldPlaceTorch(pt) local sp=(state.job and state.job.torchSpacing) or 8; return sp>0 and ((math.abs(pt.x)+math.abs(pt.z)) % sp == 0) and pt.y==state.job.origin.y end
+local function placeTorch() if turtle.getItemCount(16)<=0 then return end; turtle.select(16); turtle.placeDown() end
 local function mineLoop()
-  while true do
-    if state.status=="MINING" and state.sector and state.sector.path then
-      organizeInventory()
-      if not state.pos then gpsTry(2); local first=state.sector.path[state.currentIndex or 1]; if first and not state.pos then state.pos={x=first.x,y=first.y,z=first.z} end end
-      for i=state.currentIndex or 1, #state.sector.path do
-        state.currentIndex=i; local p=state.sector.path[i]
-        if state.job and state.job.origin and p.y < state.job.origin.y then state.currentIndex=i+1; save() else
-          if not gotoPoint(p) then state.status="ERROR"; state.error=state.error or "Unable to move to path point"; save(); send({type="ERROR",role=role,id=id,error=state.error}); break end
-          if i%20==0 then gpsTry(0.5) end
-          state.progress=math.floor((i/#state.sector.path)*100); save(); draw()
-        end
-      end
-      if state.status=="MINING" then state.status="IDLE"; state.progress=100; save(); send({type="SECTOR_COMPLETE",jobId=state.job.id,sectorId=state.sector.id}); state.job=nil; state.sector=nil; state.currentIndex=1; save() end
-    end
-    sleep(0.5)
+  if not state.job or not state.sector then return end
+  state.status="MINING"; state.error=nil; save(); organizeInventory(); gpsTry(2)
+  while state.job and state.sector and state.status=="MINING" do
+    local pt=indexToPoint(state.job,state.sector,state.currentIndex)
+    if not pt then state.status="IDLE"; send({type="SECTOR_COMPLETE",role=role,id=id,jobId=state.job.id,sectorId=state.sector.id}); state.job=nil; state.sector=nil; state.currentIndex=1; save(); return end
+    status("Moving to "..pt.x..","..pt.y..","..pt.z)
+    if not gotoXYZ(pt) then state.status="ERROR"; state.error=state.error or "Unable to path"; save(); send({type="ERROR",role=role,id=id,error=state.error}); return end
+    digDir("up") -- ceiling of current cell only, never below origin
+    if shouldPlaceTorch(pt) then placeTorch() end
+    state.currentIndex=state.currentIndex+1; if state.currentIndex%10==0 then save(); heartbeat() end
+    if turtle.getFuelLevel()~= "unlimited" and turtle.getFuelLevel()<50 then state.status="ERROR"; state.error="Low fuel"; save(); send({type="ERROR",role=role,id=id,error=state.error}); return end
   end
 end
-local function netLoop() register(); local lastReg=os.clock(); while true do local sender,msg=rednet.receive(PROTOCOL,1); if type(msg)=="table" then if msg.type=="REGISTER_ACK" then controllerId=sender elseif msg.type=="ROLL_CALL" then rednet.send(sender,{type="ROLL_CALL_RESPONSE",role=role,id=id,status=state.status,fuel=turtle.getFuelLevel(),gps=state.lastKnownGPS,gpsStatus=state.gpsStatus},PROTOCOL) elseif msg.type=="ASSIGN_JOB" or msg.type=="RESTORE_JOB" then controllerId=sender; assign(msg) elseif msg.type=="PAUSE_JOB" then state.status="IDLE"; save() elseif msg.type=="RESUME_JOB" and state.job then state.status="MINING"; save() elseif msg.type=="CANCEL_JOB" then state={role=role,status="IDLE",currentIndex=1,progress=0,gpsStatus=state.gpsStatus,lastKnownGPS=state.lastKnownGPS,pos=state.pos,facing=state.facing}; save() end end; if os.clock()-lastReg>10 then register(); lastReg=os.clock() end end end
-local function heartLoop() while true do heartbeat(); draw(); sleep(5) end end
-load(); modemSide=findModem(); gpsTry(5); draw("Boot GPS test complete."); if not modemSide then draw("ERROR: No modem."); while true do sleep(5) end end; rednet.open(modemSide); register(); send({type="REQUEST_ASSIGNMENT",role=role,id=id}); parallel.waitForAny(netLoop,heartLoop,mineLoop)
+local function assign(msg) state.job=msg.job; state.sector=msg.sector; state.currentIndex=(msg.sector and msg.sector.currentIndex) or 1; state.status="MINING"; state.error=nil; controllerId=msg.controllerId or controllerId; save(); send({type="MINER_SAFE",role=role,id=id,jobId=state.job.id,sectorId=state.sector.id}); mineLoop() end
+local function netLoop()
+  register(); local lastReg=os.clock(); while true do local sender,msg=rednet.receive(PROTOCOL,1); if type(msg)=="table" then if msg.type=="REGISTER_ACK" then controllerId=sender elseif msg.type=="ROLL_CALL" then rednet.send(sender,{type="ROLL_CALL_RESPONSE",role=role,id=id,status=state.status,gps=state.lastGPS,gpsStatus=state.gpsStatus,fuel=turtle.getFuelLevel()},PROTOCOL) elseif msg.type=="ASSIGN_JOB" or msg.type=="RESTORE_JOB" then controllerId=sender; assign(msg) elseif msg.type=="PAUSE_JOB" then state.status="LISTENING"; save() elseif msg.type=="RESUME_JOB" then if state.job then state.status="MINING"; save(); mineLoop() end elseif msg.type=="CANCEL_JOB" then state={role=role,status="LISTENING",currentIndex=1,gpsStatus=state.gpsStatus,lastGPS=state.lastGPS}; save() end end; if os.clock()-lastReg>10 then register(); lastReg=os.clock() end end
+end
+local function heartLoop() while true do heartbeat(); status(); sleep(5) end end
+load(); modemSide=findModem(); if not modemSide then status("ERROR: No modem. Attach modem and reboot."); return end; rednet.open(modemSide); gpsTry(5); organizeInventory(); parallel.waitForAny(netLoop, heartLoop)
