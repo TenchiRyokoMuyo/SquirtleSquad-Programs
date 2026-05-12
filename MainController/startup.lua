@@ -352,31 +352,126 @@ local function buildTeams()
   saveState()
 end
 
+local function cloneCoord(c)
+  if not c then return nil end
+  return { x=c.x, y=c.y, z=c.z }
+end
+
+local function cloneBounds(b)
+  if not b then return nil end
+  return {
+    minX=b.minX, maxX=b.maxX,
+    minY=b.minY, maxY=b.maxY,
+    minZ=b.minZ, maxZ=b.maxZ
+  }
+end
+
+local function compactJob(job)
+  return {
+    id = job.id,
+    shape = job.shape,
+    status = job.status,
+    origin = cloneCoord(job.origin),
+    a = cloneCoord(job.a),
+    b = cloneCoord(job.b),
+    radius = job.radius,
+    height = job.height,
+    width = job.width,
+    torchSpacing = job.torchSpacing,
+    shallow = job.shallow,
+    created = job.created
+  }
+end
+
+local function compactStorage()
+  return {
+    dump = cloneCoord(state.storage.dump),
+    supply = cloneCoord(state.storage.supply)
+  }
+end
+
+local function compactSector(sector)
+  return {
+    id = sector.id,
+    index = sector.index,
+    count = sector.count,
+    bounds = cloneBounds(sector.bounds),
+    fullBounds = cloneBounds(sector.fullBounds)
+  }
+end
+
+local function safeSend(target, packet, protocol)
+  if not target then return false end
+  local ok, payload = pcall(textutils.serialize, packet)
+  if not ok then
+    print("Packet serialization failed:")
+    print(tostring(payload))
+    log("Packet serialization failed: " .. tostring(payload))
+    return false
+  end
+  return rednet.send(target, textutils.unserialize(payload), protocol)
+end
+
 local function assignActiveJob()
   local job = state.jobs[state.activeJobId or ""]
   if not job then log("No active job to assign."); return end
   buildTeams()
   if #state.teams == 0 then log("No miners available."); return end
+
   local bounds = computeJobBounds(job)
+  if not bounds or not bounds.minX then log("Could not compute job bounds."); return end
+
   local total = #state.teams
   state.deploymentQueue = {}
+
+  local jobPacket = compactJob(job)
+  local storagePacket = compactStorage()
+
   for i,team in ipairs(state.teams) do
     local sx1 = bounds.minX + math.floor((bounds.maxX-bounds.minX+1)*(i-1)/total)
     local sx2 = bounds.minX + math.floor((bounds.maxX-bounds.minX+1)*i/total) - 1
     if i == total then sx2 = bounds.maxX end
+
     local sector = {
       id = "sector-" .. i,
       index = i,
       count = total,
-      bounds = { minX=sx1, maxX=sx2, minY=bounds.minY, maxY=bounds.maxY, minZ=bounds.minZ, maxZ=bounds.maxZ },
-      fullBounds = bounds
+      bounds = {
+        minX=sx1, maxX=sx2,
+        minY=bounds.minY, maxY=bounds.maxY,
+        minZ=bounds.minZ, maxZ=bounds.maxZ
+      },
+      fullBounds = cloneBounds(bounds)
     }
-    team.sector = sector
+
+    -- IMPORTANT:
+    -- Never save the live sector table into team.sector.
+    -- Save only primitive/copy values so textutils.serialize never sees repeated table references.
+    team.jobId = job.id
+    team.sectorId = sector.id
+    team.sectorBounds = cloneBounds(sector.bounds)
+    team.fullBounds = cloneBounds(sector.fullBounds)
+    team.deployOrder = i
+    team.status = "ASSIGNED"
+
     table.insert(state.deploymentQueue, team.id)
+
     if team.foremanNet then
-      rednet.send(team.foremanNet, {type="ASSIGN_FOREMAN", teamId=team.id, minerId=team.minerId, minerNet=team.minerNet, jobId=job.id, sector=sector}, PROTOCOL)
+      safeSend(team.foremanNet, {
+        type="ASSIGN_FOREMAN",
+        project=PROJECT,
+        version=VERSION,
+        teamId=team.id,
+        minerId=team.minerId,
+        minerNet=team.minerNet,
+        jobId=job.id,
+        sector=compactSector(sector),
+        deployOrder=i,
+        deployHold=true
+      }, PROTOCOL)
     end
-    rednet.send(team.minerNet, {
+
+    safeSend(team.minerNet, {
       type="ASSIGN_JOB",
       project=PROJECT,
       version=VERSION,
@@ -385,22 +480,26 @@ local function assignActiveJob()
       foremanId=team.foremanId,
       foremanNet=team.foremanNet,
       jobId=job.id,
-      job=job,
-      sector=sector,
-      storage=state.storage,
+      job=jobPacket,
+      sector=compactSector(sector),
+      storage=storagePacket,
       deployOrder=i,
       deployHold=true
     }, PROTOCOL)
   end
+
   job.status = "ASSIGNED"
   saveState()
   log("Assigned job to " .. tostring(#state.teams) .. " miner teams.")
+
   if #state.deploymentQueue > 0 then
     local first = state.deploymentQueue[1]
     for _,team in ipairs(state.teams) do
       if team.id == first then
-        rednet.send(team.minerNet,{type="DEPLOY_NOW",teamId=team.id,jobId=job.id},PROTOCOL)
-        if team.foremanNet then rednet.send(team.foremanNet,{type="DEPLOY_NOW",teamId=team.id,jobId=job.id},PROTOCOL) end
+        safeSend(team.minerNet,{type="DEPLOY_NOW",teamId=team.id,jobId=job.id},PROTOCOL)
+        if team.foremanNet then
+          safeSend(team.foremanNet,{type="DEPLOY_NOW",teamId=team.id,jobId=job.id},PROTOCOL)
+        end
         log("Deployment started: " .. team.id)
       end
     end
@@ -512,8 +611,8 @@ local function nextDeployment(teamId)
     if nextTeamId then
       for _,team in ipairs(state.teams) do
         if team.id == nextTeamId then
-          rednet.send(team.minerNet,{type="DEPLOY_NOW",teamId=team.id,jobId=state.activeJobId},PROTOCOL)
-          if team.foremanNet then rednet.send(team.foremanNet,{type="DEPLOY_NOW",teamId=team.id,jobId=state.activeJobId},PROTOCOL) end
+          safeSend(team.minerNet,{type="DEPLOY_NOW",teamId=team.id,jobId=state.activeJobId},PROTOCOL)
+          if team.foremanNet then safeSend(team.foremanNet,{type="DEPLOY_NOW",teamId=team.id,jobId=state.activeJobId},PROTOCOL) end
           log("Deployment started: " .. team.id)
           return
         end
