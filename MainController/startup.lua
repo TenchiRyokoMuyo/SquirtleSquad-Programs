@@ -36,12 +36,45 @@ local function ensureDir()
   if not fs.exists(DATA_DIR) then fs.makeDir(DATA_DIR) end
 end
 
+local function trySerialize(label, value)
+  local ok, result = pcall(textutils.serialize, value)
+
+  if not ok then
+    print("")
+    print("================================")
+    print("SERIALIZE FAILURE DETECTED")
+    print("LOCATION: " .. tostring(label))
+    print("ERROR:")
+    print(tostring(result))
+    print("================================")
+    print("")
+
+    log("SERIALIZE FAILURE: " .. tostring(label))
+    log(tostring(result))
+
+    return nil
+  end
+
+  return result
+end
+
 local function safeSerializeToFile(path, value)
   ensureDir()
+
+  local serialized = trySerialize("save:" .. tostring(path), value)
+  if not serialized then
+    return false
+  end
+
   local h = fs.open(path, "w")
-  if not h then return false end
-  h.write(textutils.serialize(value))
+  if not h then
+    print("FAILED TO OPEN FILE: " .. tostring(path))
+    return false
+  end
+
+  h.write(serialized)
   h.close()
+
   return true
 end
 
