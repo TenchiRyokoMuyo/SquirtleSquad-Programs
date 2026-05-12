@@ -257,7 +257,6 @@ local function netLoop()
     end
     dashboard()
   end
-end
 local function periodic()
   while true do rednet.broadcast({type="ROLL_CALL"},PROTOCOL); rednet.broadcast({type="GPS_PING"},PROTOCOL); assignJobs(); saveAll(); dashboard(); sleep(8) end
 end
