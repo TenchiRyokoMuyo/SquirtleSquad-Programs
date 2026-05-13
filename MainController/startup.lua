@@ -465,6 +465,7 @@ local function assignActiveJob()
         minerId=team.minerId,
         minerNet=team.minerNet,
         jobId=job.id,
+        job=jobPacket,
         sector=compactSector(sector),
         deployOrder=i,
         deployHold=true
