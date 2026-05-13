@@ -387,11 +387,29 @@ end
 
 local function placeTorchIfNeeded(p)
   if not state.job or not p then return end
-  local spacing=state.job.torchSpacing or 8
-  if p.y == (state.sector.fullBounds and state.sector.fullBounds.minY or state.sector.bounds.minY) and ((math.abs(p.x)+math.abs(p.z)) % spacing == 0) then
-    turtle.select(16)
-    if turtle.getItemCount(16)>0 then turtle.placeDown() end
+  local spacing = state.job.torchSpacing or 8
+  local floorY = state.sector.fullBounds and state.sector.fullBounds.minY or state.sector.bounds.minY
+  if p.y ~= floorY then turtle.select(1); return end
+
+  local ox, oz
+  if state.job.origin then
+    ox, oz = state.job.origin.x, state.job.origin.z
+  elseif state.job.a then
+    ox, oz = state.job.a.x, state.job.a.z
+  else
+    ox, oz = 0, 0
   end
+
+  -- True origin-relative square grid: every 8 blocks on X AND every 8 blocks on Z.
+  -- This prevents diagonal torch lines caused by abs(x)+abs(z) math.
+  local onGridX = ((p.x - ox) % spacing) == 0
+  local onGridZ = ((p.z - oz) % spacing) == 0
+
+  if onGridX and onGridZ then
+    turtle.select(16)
+    if turtle.getItemCount(16) > 0 then turtle.placeDown() end
+  end
+
   turtle.select(1)
 end
 
