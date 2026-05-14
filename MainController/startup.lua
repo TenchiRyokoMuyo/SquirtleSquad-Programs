@@ -1,15 +1,15 @@
--- SquirtleSquad-Miner v1.1
+-- SquirtleSquad-Miner v1.2
 -- MainController/startup.lua
 -- Patch focus:
---   * Layers replace height for cylinder/cone/pyramid. Legacy job.height is still understood.
---   * Turtle-local homes replace shared storage requirement.
+--   * Layers replace height for cylinder/cone/pyramid.
+--   * Turtle-local homes fully replace shared storage.
 --   * Scrollable menus for controller choices.
 --   * Live turtle coordinate viewer and GO_HOME command.
 --   * Reset connected GPS subhosts.
 
 local PROTOCOL = "TurtleTeamNet"
 local PROJECT = "SquirtleSquad-Miner"
-local VERSION = "v1.1"
+local VERSION = "v1.2"
 local DATA_DIR = "SquirtleSquadData"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
 
@@ -17,7 +17,6 @@ local state = {
   version = VERSION,
   controllerId = os.getComputerID(),
   gps = { x=nil, y=nil, z=nil, hostEnabled=true },
-  storage = {}, -- legacy only; miners now use local home chests
   agents = {},
   teams = {},
   jobs = {},
@@ -48,7 +47,6 @@ local function healState(s)
   s.controllerId=s.controllerId or os.getComputerID()
   s.gps=s.gps or {hostEnabled=true}
   if s.gps.hostEnabled==nil then s.gps.hostEnabled=true end
-  s.storage=s.storage or {}
   s.agents=s.agents or {}
   s.teams=s.teams or {}
   s.jobs=s.jobs or {}
@@ -157,14 +155,14 @@ local function drawDashboard()
   term.redirect(old)
 end
 
-local function jobLayers(job) return math.max(1, tonumber(job.layers or job.height or 1) or 1) end
+local function jobLayers(job) return math.max(1, tonumber(job.layers or 1) or 1) end
 
 local function createJob()
   local choices={
     {"Rectangular Prism", "rect"}, {"Cylinder", "cylinder"}, {"Dome", "dome"}, {"Stretched Cylinder", "stretched_cylinder"},
     {"Pyramid", "pyramid"}, {"Cone", "cone"}, {"Tunnel", "tunnel"}, {"Tunnel Spline", "tunnel_spline"},
   }
-  local shape=chooseMenu("Create Job",choices,"Storage chests are no longer configured here; each miner uses its own home chests.")
+  local shape=chooseMenu("Create Job",choices,"Each miner uses its own home chests. No controller storage is used.")
   if not shape then return end
   header(term)
   local job={id=makeId("job"),status="CREATED",torchSpacing=8,created=os.epoch("utc"),shape=shape}
@@ -197,7 +195,6 @@ local function createJob()
     job.a=promptCoord("origin"); job.b=promptCoord("destination")
     job.width=promptNumber("Width",3); job.height=promptNumber("Height",job.width); job.shallow=true
   end
-  if shape=="cylinder" or shape=="cone" or shape=="pyramid" then job.height=job.layers end -- legacy compatibility for older miners if any remain
   if not job.shape then print("Invalid job."); sleep(1); return end
   state.jobs[job.id]=job; state.activeJobId=job.id
   log("Job created: "..job.id.." ("..job.shape..")")
