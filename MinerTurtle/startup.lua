@@ -1,15 +1,14 @@
--- SquirtleSquad-Miner v1.2
+-- SquirtleSquad-Miner v1.3
 -- MinerTurtle/startup.lua
--- Patch focus:
--- * Local turtle home: chest above = fuel/torches, chest below = deposit/filler recovery.
--- * Layer-based excavation: origin Y is layer 1. job.layers is preferred, job.height is legacy fallback.
--- * 3-layer vertical pass mining: travel through the middle layer and mine down/current/up without task-facing spins.
--- * GO_HOME command and job-complete return/service.
--- * ComputerCraft / CC:Tweaked blocks are protected from mining.
+-- Fixes in this version:
+-- * Restores torch placement on the 8x8 grid during 3-layer mining passes.
+-- * Torch grid is now based on job origin, not world-coordinate sum.
+-- * Return-home routing now goes to layer-2 origin first, then returns home.
+-- * Keeps ComputerCraft / CC:Tweaked blocks protected from mining.
 
 local PROTOCOL = "TurtleTeamNet"
 local PROJECT = "SquirtleSquad-Miner"
-local VERSION = "v1.2"
+local VERSION = "v1.3"
 
 local DATA_DIR = "SquirtleSquadData"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -606,8 +605,7 @@ local function gotoXYZ(p)
         return false
     end
 
-    -- Preserve existing safe travel style: vertical first to the higher Y,
-    -- then X/Z, then exact Y.
+    -- Normal travel style: move at the higher Y, then exact target Y.
     local travelY = math.max(state.pos.y, p.y)
 
     if not goY(travelY) then
@@ -623,6 +621,28 @@ local function gotoXYZ(p)
     end
 
     if not goY(p.y) then
+        return false
+    end
+
+    return true
+end
+
+local function gotoXYZLowFirst(p)
+    if not state.pos or not p then
+        return false
+    end
+
+    -- Used only for returning home from upper excavation layers.
+    -- It intentionally descends first, then travels sideways.
+    if not goY(p.y) then
+        return false
+    end
+
+    if not goX(p.x) then
+        return false
+    end
+
+    if not goZ(p.z) then
         return false
     end
 
@@ -774,6 +794,65 @@ local function inside(job, x, y, z)
     return false
 end
 
+local function jobOriginPoint()
+    local job = state.job
+
+    if not job then
+        return nil
+    end
+
+    if job.origin then
+        return {
+            x = job.origin.x,
+            y = job.origin.y,
+            z = job.origin.z
+        }
+    end
+
+    if job.a then
+        return {
+            x = job.a.x,
+            y = job.a.y,
+            z = job.a.z
+        }
+    end
+
+    if state.sector and state.sector.bounds then
+        return {
+            x = state.sector.bounds.minX,
+            y = state.sector.bounds.minY,
+            z = state.sector.bounds.minZ
+        }
+    end
+
+    return nil
+end
+
+local function layerTwoOriginPoint()
+    local o = jobOriginPoint()
+
+    if not o then
+        return nil
+    end
+
+    local minY = o.y
+    local maxY = o.y
+
+    if state.sector and state.sector.bounds then
+        minY = state.sector.bounds.minY or o.y
+        maxY = state.sector.bounds.maxY or o.y
+    end
+
+    -- "Layer 2" is origin/min Y + 1, but never above the job's max Y.
+    local y = math.min(minY + 1, maxY)
+
+    return {
+        x = o.x,
+        y = y,
+        z = o.z
+    }
+end
+
 local function batchCount()
     local b = state.sector.bounds
     return math.ceil((b.maxY - b.minY + 1) / 3)
@@ -843,26 +922,44 @@ local function nextMiningColumn()
     return nil
 end
 
+local function torchGridMatches(c)
+    local spacing = tonumber(state.job.torchSpacing or 8) or 8
+    local origin = jobOriginPoint() or { x = 0, z = 0 }
+
+    local dx = c.x - origin.x
+    local dz = c.z - origin.z
+
+    return (dx % spacing == 0) and (dz % spacing == 0)
+end
+
 local function placeTorchIfNeeded(c)
     if not state.job or not c then
         return
     end
 
-    local spacing = state.job.torchSpacing or 8
     local floorY = state.sector.fullBounds and state.sector.fullBounds.minY or state.sector.bounds.minY
 
-    if c.startY == floorY
-        and c.travelY == floorY
-        and ((math.abs(c.x) + math.abs(c.z)) % spacing == 0)
-    then
-        turtle.select(16)
-
-        if turtle.getItemCount(16) > 0 then
-            turtle.placeDown()
-        end
-
-        turtle.select(1)
+    -- Torches only belong on the first vertical mining pass.
+    -- In the 3-layer system, the first pass usually has:
+    --   startY = floorY
+    --   travelY = floorY + 1
+    -- The previous logic required travelY == floorY, which prevented all torch placement
+    -- on normal 3-layer passes.
+    if c.startY ~= floorY then
+        return
     end
+
+    if not torchGridMatches(c) then
+        return
+    end
+
+    turtle.select(16)
+
+    if turtle.getItemCount(16) > 0 then
+        turtle.placeDown()
+    end
+
+    turtle.select(1)
 end
 
 local function fillOvercutsNearColumn(c)
@@ -944,6 +1041,19 @@ local function refillFillerFromBelowOrInventory()
     turtle.select(1)
 end
 
+local function routeToSafeReturnPoint()
+    local safePoint = layerTwoOriginPoint()
+
+    if not safePoint then
+        return true
+    end
+
+    status("RETURNING_TO_LAYER2_ORIGIN")
+
+    -- Descend first, then move horizontally to the safe origin corridor.
+    return gotoXYZLowFirst(safePoint)
+end
+
 local function goHomeAndService(reason, returnAfter)
     if not state.home then
         return false
@@ -968,6 +1078,16 @@ local function goHomeAndService(reason, returnAfter)
         pos = clonePos(state.pos),
         home = clonePos(state.home)
     })
+
+    -- New return route:
+    -- Upper mining layers should not path home while still high.
+    -- First descend/travel to layer-2 origin, then use the normal route to home.
+    if state.job and state.sector then
+        if not routeToSafeReturnPoint() then
+            status("SAFE_RETURN_POINT_FAILED")
+            return false
+        end
+    end
 
     if not gotoXYZ(state.home) then
         status("HOME_PATH_FAILED")
@@ -1072,25 +1192,7 @@ local function ensureHomeSetup()
 end
 
 local function originForJob()
-    local job = state.job
-
-    if job.origin then
-        return {
-            x = job.origin.x,
-            y = job.origin.y,
-            z = job.origin.z
-        }
-    end
-
-    if job.a then
-        return {
-            x = job.a.x,
-            y = job.a.y,
-            z = job.a.z
-        }
-    end
-
-    return {
+    return jobOriginPoint() or {
         x = state.sector.bounds.minX,
         y = state.sector.bounds.minY,
         z = state.sector.bounds.minZ
