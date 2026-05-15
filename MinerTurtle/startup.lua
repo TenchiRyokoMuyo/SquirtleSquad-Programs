@@ -5,10 +5,12 @@
 -- * Torch grid is now based on job origin, not world-coordinate sum.
 -- * Return-home routing now goes to layer-2 origin first, then returns home.
 -- * Keeps ComputerCraft / CC:Tweaked blocks protected from mining.
+-- * Torch placement/breaking only happens during the first layer-2 pass.
+-- * Progress is only advanced after a column is successfully reached and mined.
 
 local PROTOCOL = "TurtleTeamNet"
 local PROJECT = "SquirtleSquad-Miner"
-local VERSION = "v1.3"
+local VERSION = "v1.4"
 
 local DATA_DIR = "SquirtleSquadData"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -230,6 +232,24 @@ local function homeChestsPresent()
     return hasChestUp() and hasChestDown()
 end
 
+local function firstTorchPassComplete()
+    if not state.sector or not state.sector.bounds then
+        return false
+    end
+
+    local b = state.sector.bounds
+    local columns = (b.maxX - b.minX + 1) * (b.maxZ - b.minZ + 1)
+
+    return (tonumber(state.progress) or 0) >= columns
+end
+
+local function torchesAreMutable()
+    -- Torches are only allowed to be broken/replaced while the first vertical pass
+    -- is active. In the 3-layer system this is the pass that travels layer 2
+    -- and clears layers 1, 2, and 3.
+    return not firstTorchPassComplete()
+end
+
 local function inspectIsProtected(inspector)
     local ok, data = inspector()
 
@@ -239,9 +259,15 @@ local function inspectIsProtected(inspector)
 
     local name = string.lower(data.name)
 
-    -- Torches are intentionally allowed to be broken/replaced.
+    -- Torches are allowed to be broken only during the initial torch-placement pass.
+    -- After layer-2/first-pass work is complete, torches become protected so
+    -- return-home travel and later upper-layer passes do not strip the grid.
     if name:find("torch", 1, true) then
-        return false, data
+        if torchesAreMutable() then
+            return false, data
+        end
+
+        return true, data
     end
 
     for _, needle in ipairs(protectedNeedles) do
@@ -908,18 +934,34 @@ end
 local function nextMiningColumn()
     local b = state.sector.bounds
     local total = (b.maxX - b.minX + 1) * (b.maxZ - b.minZ + 1) * batchCount()
+    local idx = tonumber(state.progress) or 0
 
-    while state.progress < total do
-        local c = columnFromIndex(state.progress)
-        state.progress = state.progress + 1
+    while idx < total do
+        local c = columnFromIndex(idx)
 
         if c and columnHasWork(c) then
-            save()
+            c.index = idx
             return c
         end
+
+        -- Empty/outside columns are safe to skip immediately.
+        idx = idx + 1
+        state.progress = idx
+        save()
     end
 
     return nil
+end
+
+local function markColumnComplete(c)
+    if not c or c.index == nil then
+        return
+    end
+
+    if (tonumber(state.progress) or 0) <= c.index then
+        state.progress = c.index + 1
+        save()
+    end
 end
 
 local function torchGridMatches(c)
@@ -934,6 +976,10 @@ end
 
 local function placeTorchIfNeeded(c)
     if not state.job or not c then
+        return
+    end
+
+    if not torchesAreMutable() then
         return
     end
 
@@ -1309,6 +1355,7 @@ local function mineLoop()
         end
 
         mineColumn(c)
+        markColumnComplete(c)
     end
 end
 
