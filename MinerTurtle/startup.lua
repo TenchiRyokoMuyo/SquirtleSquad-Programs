@@ -1,4 +1,4 @@
--- SquirtleSquad-Miner v1.3
+-- SquirtleSquad-Miner v1.6
 -- MinerTurtle/startup.lua
 -- Fixes in this version:
 -- * Restores torch placement on the 8x8 grid during 3-layer mining passes.
@@ -10,7 +10,7 @@
 
 local PROTOCOL = "TurtleTeamNet"
 local PROJECT = "SquirtleSquad-Miner"
-local VERSION = "v1.4"
+local VERSION = "v1.6"
 
 local DATA_DIR = "SquirtleSquadData"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -43,7 +43,24 @@ local state = {
     waitingForHomeConfirm = false,
 
     forceHome = false,
-    resumeAfterHome = false
+    resumeAfterHome = false,
+    cancelRequested = false,
+
+    protectedBlocks = {
+        "minecraft:spawner",
+        "computercraft:",
+        "turtle",
+        "computer",
+        "modem",
+        "monitor",
+        "drive",
+        "disk_drive",
+        "speaker",
+        "printer",
+        "display_link",
+        "create:display_link"
+    },
+    protectedRevision = 0
 }
 
 local running = true
@@ -56,11 +73,14 @@ local DIRS = {
     west  = { x = -1, z = 0,  left = "south", right = "north", back = "east"  }
 }
 
-local protectedNeedles = {
+local defaultProtectedNeedles = {
     -- Storage / inventory
     "chest",
     "barrel",
     "shulker",
+
+    -- Vanilla / dangerous infrastructure
+    "minecraft:spawner",
 
     -- ComputerCraft / CC:Tweaked namespace protection
     "computercraft:",
@@ -81,6 +101,36 @@ local protectedNeedles = {
     "scaffolding",
     "create:display_link"
 }
+
+local function normalizeProtectedList(list)
+    local out = {}
+    local seen = {}
+
+    for _, v in ipairs(defaultProtectedNeedles) do
+        local s = string.lower(tostring(v or ""))
+        if s ~= "" and not seen[s] then
+            table.insert(out, s)
+            seen[s] = true
+        end
+    end
+
+    if type(list) == "table" then
+        for _, v in ipairs(list) do
+            local s = string.lower(tostring(v or ""))
+            if s ~= "" and not seen[s] then
+                table.insert(out, s)
+                seen[s] = true
+            end
+        end
+    end
+
+    return out
+end
+
+local function getProtectedNeedles()
+    state.protectedBlocks = normalizeProtectedList(state.protectedBlocks)
+    return state.protectedBlocks
+end
 
 local function ensureDir()
     if not fs.exists(DATA_DIR) then
@@ -110,6 +160,8 @@ local function load()
                 for k, v in pairs(t) do
                     state[k] = v
                 end
+                state.protectedBlocks = normalizeProtectedList(state.protectedBlocks)
+                state.protectedRevision = tonumber(state.protectedRevision) or 0
             end
         end
     end
@@ -270,7 +322,7 @@ local function inspectIsProtected(inspector)
         return true, data
     end
 
-    for _, needle in ipairs(protectedNeedles) do
+    for _, needle in ipairs(getProtectedNeedles()) do
         if name:find(needle, 1, true) then
             return true, data
         end
@@ -414,6 +466,66 @@ local function requestForemanMove()
     end
 end
 
+local function isLavaData(data)
+    if not data or not data.name then
+        return false
+    end
+
+    local name = string.lower(data.name)
+    return name == "minecraft:lava" or name:find("lava", 1, true) ~= nil
+end
+
+local function useFillerForward()
+    if turtle.getItemCount(2) <= 0 then
+        return false
+    end
+
+    turtle.select(2)
+    local placed = turtle.place()
+    sleep(0.15)
+
+    if placed then
+        turtle.dig()
+    end
+
+    turtle.select(1)
+    return placed
+end
+
+local function useFillerUp()
+    if turtle.getItemCount(2) <= 0 then
+        return false
+    end
+
+    turtle.select(2)
+    local placed = turtle.placeUp()
+    sleep(0.15)
+
+    if placed then
+        turtle.digUp()
+    end
+
+    turtle.select(1)
+    return placed
+end
+
+local function useFillerDown()
+    if turtle.getItemCount(2) <= 0 then
+        return false
+    end
+
+    turtle.select(2)
+    local placed = turtle.placeDown()
+    sleep(0.15)
+
+    if placed then
+        turtle.digDown()
+    end
+
+    turtle.select(1)
+    return placed
+end
+
 local function digForwardIfSafe()
     local prot, data = inspectIsProtected(turtle.inspect)
 
@@ -424,6 +536,13 @@ local function digForwardIfSafe()
         if prot then
             return false, "protected"
         end
+    end
+
+    if isLavaData(data) then
+        if useFillerForward() then
+            return true
+        end
+        return false, "lava_no_filler"
     end
 
     if data then
@@ -440,6 +559,13 @@ local function digUpIfSafe()
         return false, "protected"
     end
 
+    if isLavaData(data) then
+        if useFillerUp() then
+            return true
+        end
+        return false, "lava_no_filler"
+    end
+
     if data then
         turtle.digUp()
     end
@@ -452,6 +578,13 @@ local function digDownIfSafe()
 
     if prot then
         return false, "protected"
+    end
+
+    if isLavaData(data) then
+        if useFillerDown() then
+            return true
+        end
+        return false, "lava_no_filler"
     end
 
     if data then
@@ -551,6 +684,123 @@ local function moveDownRaw()
     return false, "blocked"
 end
 
+local goY
+local goX
+local goZ
+
+local function snapshotPose()
+    return {
+        x = state.pos and state.pos.x,
+        y = state.pos and state.pos.y,
+        z = state.pos and state.pos.z,
+        f = state.facing
+    }
+end
+
+local function restorePose(pose)
+    if not pose or not pose.x then
+        return false
+    end
+
+    local ok = true
+    if state.pos and state.pos.y ~= pose.y then
+        ok = goY(pose.y) and ok
+    end
+    if state.pos and state.pos.x ~= pose.x then
+        ok = goX(pose.x) and ok
+    end
+    if state.pos and state.pos.z ~= pose.z then
+        ok = goZ(pose.z) and ok
+    end
+    turnTo(pose.f)
+    return ok
+end
+
+local function tryVerticalProtectedBypass()
+    local start = snapshotPose()
+    status("PROTECTED_BYPASS_UP_1")
+
+    if moveUpRaw() then
+        turnTo(start.f)
+
+        if moveForwardRaw() then
+            if moveDownRaw() then
+                status("MINING")
+                return true
+            end
+        end
+    end
+
+    restorePose(start)
+    status("PROTECTED_BYPASS_UP_2")
+
+    if moveUpRaw() and moveUpRaw() then
+        turnTo(start.f)
+
+        if moveForwardRaw() then
+            if moveDownRaw() and moveDownRaw() then
+                status("MINING")
+                return true
+            end
+        end
+    end
+
+    restorePose(start)
+    return false
+end
+
+local function trySideProtectedBypass(leftFirst)
+    local start = snapshotPose()
+    local sideTurn = leftFirst and turnLeft or turnRight
+    local undoTurn = leftFirst and turnRight or turnLeft
+    local label = leftFirst and "LEFT" or "RIGHT"
+
+    status("PROTECTED_BYPASS_" .. label)
+
+    sideTurn()
+    if not moveForwardRaw() then
+        restorePose(start)
+        return false
+    end
+
+    undoTurn()
+    if not moveForwardRaw() then
+        restorePose(start)
+        return false
+    end
+
+    undoTurn()
+    if not moveForwardRaw() then
+        restorePose(start)
+        return false
+    end
+
+    sideTurn()
+    status("MINING")
+    return true
+end
+
+local function tryProtectedBypass()
+    -- Protected-object bypass order:
+    -- 1. Up one, forward, down.
+    -- 2. Up two, forward, down two.
+    -- 3. Return to original layer and try side bypasses.
+    if tryVerticalProtectedBypass() then
+        return true
+    end
+
+    if trySideProtectedBypass(true) then
+        return true
+    end
+
+    if trySideProtectedBypass(false) then
+        return true
+    end
+
+    status("PROTECTED_BLOCK_WAIT")
+    return false
+end
+
 local function safeForward()
     local ok, why = moveForwardRaw()
 
@@ -559,14 +809,13 @@ local function safeForward()
     end
 
     if why == "protected" then
-        status("PROTECTED_BLOCK_WAIT")
-        return false
+        return tryProtectedBypass()
     end
 
     return false
 end
 
-local function goY(y)
+function goY(y)
     while state.pos.y < y do
         if not moveUpRaw() then
             return false
@@ -582,7 +831,7 @@ local function goY(y)
     return true
 end
 
-local function goX(x)
+function goX(x)
     if state.pos.x < x then
         turnTo("east")
 
@@ -604,7 +853,7 @@ local function goX(x)
     return true
 end
 
-local function goZ(z)
+function goZ(z)
     if state.pos.z < z then
         turnTo("south")
 
@@ -1009,11 +1258,16 @@ local function placeTorchIfNeeded(c)
 end
 
 local function fillOvercutsNearColumn(c)
-    if not c then
+    if not c or not state.sector or not state.sector.bounds or not state.job then
         return
     end
 
-    if c.travelY > (state.sector.fullBounds and state.sector.fullBounds.minY or state.sector.bounds.minY) then
+    local baseY = state.sector.bounds.minY
+    if state.sector.fullBounds and state.sector.fullBounds.minY then
+        baseY = state.sector.fullBounds.minY
+    end
+
+    if c.travelY > baseY then
         local belowInside = inside(state.job, c.x, c.travelY - 1, c.z)
         local ok = turtle.inspectDown()
 
@@ -1249,8 +1503,34 @@ local function waitForDeploy()
     status("ASSIGNED_WAITING_DEPLOY")
 
     while state.deployHold and running do
+        if state.cancelRequested then
+            return false
+        end
         sleep(1)
     end
+
+    return true
+end
+
+local function finishCancel()
+    state.cancelRequested = false
+    save()
+
+    if state.home then
+        goHomeAndService("CANCELLED_GOING_HOME", false)
+    else
+        status("CANCELLED_NO_HOME")
+    end
+
+    state.job = nil
+    state.sector = nil
+    state.complete = false
+    state.progress = 0
+    state.deployHold = true
+    state.forceHome = false
+    state.resumeAfterHome = false
+    save()
+    status("CANCELLED_AT_HOME")
 end
 
 local function mineLoop()
@@ -1260,7 +1540,16 @@ local function mineLoop()
     end
 
     ensureHomeSetup()
-    waitForDeploy()
+
+    if not waitForDeploy() then
+        finishCancel()
+        return
+    end
+
+    if state.cancelRequested then
+        finishCancel()
+        return
+    end
 
     local origin = originForJob()
     local firstY = state.sector.bounds.minY
@@ -1288,6 +1577,11 @@ local function mineLoop()
     status("MINING")
 
     while running and not state.complete do
+        if state.cancelRequested then
+            finishCancel()
+            return
+        end
+
         if state.forceHome then
             local resume = state.resumeAfterHome
             state.forceHome = false
@@ -1354,6 +1648,11 @@ local function mineLoop()
             return
         end
 
+        if state.cancelRequested then
+            finishCancel()
+            return
+        end
+
         mineColumn(c)
         markColumnComplete(c)
     end
@@ -1369,6 +1668,12 @@ local function networkLoop()
                 state.agentId = msg.agentId
                 save()
 
+            elseif msg.type == "PROTECTED_LIST_UPDATE" then
+                state.protectedBlocks = normalizeProtectedList(msg.protectedBlocks or msg.list)
+                state.protectedRevision = tonumber(msg.revision) or state.protectedRevision or 0
+                save()
+                status("PROTECTED_LIST_UPDATED")
+
             elseif msg.type == "ASSIGN_JOB" then
                 state.controllerId = sender
                 state.teamId = msg.teamId
@@ -1380,6 +1685,7 @@ local function networkLoop()
                 state.complete = false
                 state.forceHome = false
                 state.resumeAfterHome = false
+                state.cancelRequested = false
                 save()
                 status("ASSIGNED")
 
@@ -1403,14 +1709,14 @@ local function networkLoop()
                 status("GO_HOME_REQUESTED")
 
             elseif msg.type == "CANCEL_JOB" then
-                state.job = nil
-                state.sector = nil
-                state.complete = false
-                state.progress = 0
-                state.forceHome = true
+                -- Do not nil state.job/state.sector from the network thread.
+                -- mineLoop may currently be inside mineColumn/fillOvercuts and still needs
+                -- those tables until it reaches a safe cancellation point.
+                state.cancelRequested = true
+                state.forceHome = false
                 state.resumeAfterHome = false
                 save()
-                status("CANCELLED_GOING_HOME")
+                status("CANCEL_REQUESTED")
 
             elseif msg.type == "ROLL_CALL" then
                 send({
@@ -1433,6 +1739,7 @@ local function heartbeatLoop()
             role = "miner",
             label = state.label,
             status = state.status,
+            protectedRevision = state.protectedRevision,
             x = state.pos and state.pos.x,
             y = state.pos and state.pos.y,
             z = state.pos and state.pos.z
@@ -1443,6 +1750,7 @@ local function heartbeatLoop()
             role = "miner",
             label = state.label,
             status = state.status,
+            protectedRevision = state.protectedRevision,
             x = state.pos and state.pos.x,
             y = state.pos and state.pos.y,
             z = state.pos and state.pos.z,
@@ -1464,7 +1772,9 @@ local function workLoop()
     ensureHomeSetup()
 
     while running do
-        if state.job and state.sector and not state.complete then
+        if state.cancelRequested then
+            finishCancel()
+        elseif state.job and state.sector and not state.complete then
             mineLoop()
         else
             if state.forceHome then
@@ -1489,6 +1799,8 @@ end
 
 ensureDir()
 load()
+state.protectedBlocks = normalizeProtectedList(state.protectedBlocks)
+state.protectedRevision = tonumber(state.protectedRevision) or 0
 openModem()
 save()
 
