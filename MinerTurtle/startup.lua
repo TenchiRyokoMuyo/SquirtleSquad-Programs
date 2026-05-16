@@ -10,7 +10,7 @@
 
 local PROTOCOL = "TurtleTeamNet"
 local PROJECT = "SquirtleSquad-Miner"
-local VERSION = "v1.6"
+local VERSION = "v1.8"
 
 local DATA_DIR = "SquirtleSquadData"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -60,7 +60,11 @@ local state = {
         "display_link",
         "create:display_link"
     },
-    protectedRevision = 0
+    protectedRevision = 0,
+
+    gpsCheckInterval = 24,
+    movesSinceGpsCheck = 0,
+    lastGpsCheck = 0
 }
 
 local running = true
@@ -221,6 +225,69 @@ local function clonePos(p)
     }
 end
 
+local function gpsPosition(timeout)
+    local x, y, z = gps.locate(timeout or 5)
+
+    if x and y and z then
+        return {
+            x = math.floor(x + 0.5),
+            y = math.floor(y + 0.5),
+            z = math.floor(z + 0.5)
+        }
+    end
+
+    return nil
+end
+
+local function samePos(a, b)
+    return a and b and a.x == b.x and a.y == b.y and a.z == b.z
+end
+
+local function setPosFromGps(reason)
+    local p = gpsPosition(5)
+
+    if not p then
+        return false
+    end
+
+    state.pos = p
+    state.lastGpsCheck = os.epoch("utc")
+    state.movesSinceGpsCheck = 0
+    save()
+
+    if reason then
+        status(reason)
+    end
+
+    return true
+end
+
+local function syncGpsSoft(reason)
+    local p = gpsPosition(3)
+
+    if not p then
+        return true
+    end
+
+    state.lastGpsCheck = os.epoch("utc")
+    state.movesSinceGpsCheck = 0
+
+    if not state.pos or not samePos(state.pos, p) then
+        state.pos = p
+        save()
+
+        if reason then
+            status(reason)
+        end
+
+        return false
+    end
+
+    save()
+    return true
+end
+
+
 local function header()
     term.clear()
     term.setCursorPos(1, 1)
@@ -349,6 +416,11 @@ local function refuelIfNeeded()
     return turtle.getFuelLevel() == "unlimited" or turtle.getFuelLevel() > 50
 end
 
+local function markMoved()
+    state.movesSinceGpsCheck = (tonumber(state.movesSinceGpsCheck) or 0) + 1
+    save()
+end
+
 local function mergeFiller()
     local detail = turtle.getItemDetail(2)
 
@@ -431,6 +503,31 @@ local function updateBack()
     local d = DIRS[state.facing or "north"]
     state.pos.x = state.pos.x - d.x
     state.pos.z = state.pos.z - d.z
+end
+
+local function moveBackRaw()
+    refuelIfNeeded()
+
+    for _ = 1, 3 do
+        if turtle.back() then
+            updateBack()
+            markMoved()
+            save()
+
+            sendTo(state.foremanNet, {
+                type = "MINER_MOVED_BACK",
+                teamId = state.teamId,
+                pos = clonePos(state.pos),
+                facing = state.facing
+            })
+
+            return true
+        end
+
+        sleep(0.2)
+    end
+
+    return false, "blocked"
 end
 
 local function requestForemanMove()
@@ -600,6 +697,7 @@ local function moveForwardRaw()
     for _ = 1, 3 do
         if turtle.forward() then
             updateForward()
+            markMoved()
             save()
 
             sendTo(state.foremanNet, {
@@ -630,6 +728,7 @@ local function moveUpRaw()
     for _ = 1, 3 do
         if turtle.up() then
             state.pos.y = state.pos.y + 1
+            markMoved()
             save()
 
             sendTo(state.foremanNet, {
@@ -660,6 +759,7 @@ local function moveDownRaw()
     for _ = 1, 3 do
         if turtle.down() then
             state.pos.y = state.pos.y - 1
+            markMoved()
             save()
 
             sendTo(state.foremanNet, {
@@ -716,36 +816,85 @@ local function restorePose(pose)
     return ok
 end
 
-local function tryVerticalProtectedBypass()
+local function rollbackVerticalBypass(start, movedForward, movedUp)
+    -- Do not use gotoXYZ here. If the turtle is above a protected modem/computer,
+    -- pathing downward will fail. Instead, reverse the exact bypass steps.
+    turnTo(start.f)
+
+    while movedForward > 0 do
+        if not moveBackRaw() then
+            break
+        end
+        movedForward = movedForward - 1
+    end
+
+    while movedUp > 0 do
+        if not moveDownRaw() then
+            break
+        end
+        movedUp = movedUp - 1
+    end
+
+    turnTo(start.f)
+end
+
+local function tryVerticalHop(height)
     local start = snapshotPose()
-    status("PROTECTED_BYPASS_UP_1")
+    local movedUp = 0
+    local movedForward = 0
 
-    if moveUpRaw() then
-        turnTo(start.f)
+    status("PROTECTED_BYPASS_UP_" .. tostring(height))
 
-        if moveForwardRaw() then
-            if moveDownRaw() then
-                status("MINING")
-                return true
-            end
+    for _ = 1, height do
+        if not moveUpRaw() then
+            rollbackVerticalBypass(start, movedForward, movedUp)
+            return false
         end
+        movedUp = movedUp + 1
     end
 
-    restorePose(start)
-    status("PROTECTED_BYPASS_UP_2")
+    turnTo(start.f)
 
-    if moveUpRaw() and moveUpRaw() then
-        turnTo(start.f)
+    -- First forward moves over the protected block.
+    if not moveForwardRaw() then
+        rollbackVerticalBypass(start, movedForward, movedUp)
+        return false
+    end
+    movedForward = movedForward + 1
 
-        if moveForwardRaw() then
-            if moveDownRaw() and moveDownRaw() then
-                status("MINING")
-                return true
-            end
+    -- Second forward moves past it. Without this step, the turtle ends up
+    -- sitting directly on top of the protected modem/computer and cannot descend.
+    if not moveForwardRaw() then
+        rollbackVerticalBypass(start, movedForward, movedUp)
+        return false
+    end
+    movedForward = movedForward + 1
+
+    for _ = 1, height do
+        if not moveDownRaw() then
+            rollbackVerticalBypass(start, movedForward, movedUp)
+            return false
         end
+        movedUp = movedUp - 1
     end
 
-    restorePose(start)
+    status("MINING")
+    return true
+end
+
+local function tryVerticalProtectedBypass()
+    -- Protected-object bypass order:
+    -- 1. Up one, forward over object, forward past object, down.
+    -- 2. Up two, forward over object, forward past object, down two.
+    -- This avoids ending on top of the protected modem/computer.
+    if tryVerticalHop(1) then
+        return true
+    end
+
+    if tryVerticalHop(2) then
+        return true
+    end
+
     return false
 end
 
@@ -764,6 +913,13 @@ local function trySideProtectedBypass(leftFirst)
     end
 
     undoTurn()
+
+    -- Move past the protected object, not merely alongside it.
+    if not moveForwardRaw() then
+        restorePose(start)
+        return false
+    end
+
     if not moveForwardRaw() then
         restorePose(start)
         return false
@@ -782,8 +938,8 @@ end
 
 local function tryProtectedBypass()
     -- Protected-object bypass order:
-    -- 1. Up one, forward, down.
-    -- 2. Up two, forward, down two.
+    -- 1. Fly over and past the object at +1Y, then descend.
+    -- 2. Fly over and past the object at +2Y, then descend.
     -- 3. Return to original layer and try side bypasses.
     if tryVerticalProtectedBypass() then
         return true
@@ -1128,6 +1284,74 @@ local function layerTwoOriginPoint()
     }
 end
 
+local function returnToOriginAndConfirmGps()
+    local origin = layerTwoOriginPoint() or jobOriginPoint()
+
+    if not origin then
+        return setPosFromGps("GPS_SYNCED")
+    end
+
+    status("GPS_CORRECTING_TO_ORIGIN")
+
+    -- Use low-first pathing so the turtle descends into the known safe corridor,
+    -- then returns to the origin reference point.
+    gotoXYZLowFirst(origin)
+
+    local p = gpsPosition(6)
+    if p then
+        state.pos = p
+        state.lastGpsCheck = os.epoch("utc")
+        state.movesSinceGpsCheck = 0
+        save()
+        status("GPS_CONFIRMED_ORIGIN")
+        return samePos(p, origin)
+    end
+
+    status("GPS_CONFIRM_FAILED")
+    return false
+end
+
+local function periodicGpsCheck(returnPos)
+    local interval = tonumber(state.gpsCheckInterval) or 24
+
+    if (tonumber(state.movesSinceGpsCheck) or 0) < interval then
+        return true
+    end
+
+    local expected = clonePos(state.pos)
+    local ok = syncGpsSoft("GPS_SYNCED")
+
+    if ok then
+        return true
+    end
+
+    local workReturn = returnPos
+    if not workReturn and expected then
+        workReturn = {
+            x = expected.x,
+            y = expected.y,
+            z = expected.z,
+            f = state.facing
+        }
+    end
+
+    local corrected = returnToOriginAndConfirmGps()
+
+    if corrected and workReturn then
+        status("GPS_RETURNING_TO_WORK")
+        gotoXYZ({
+            x = workReturn.x,
+            y = workReturn.y,
+            z = workReturn.z
+        })
+        turnTo(workReturn.f)
+        status("MINING")
+    end
+
+    return corrected
+end
+
+
 local function batchCount()
     local b = state.sector.bounds
     return math.ceil((b.maxY - b.minY + 1) / 3)
@@ -1394,6 +1618,40 @@ local function goHomeAndService(reason, returnAfter)
         return false
     end
 
+    status("CONFIRMING_HOME_GPS")
+
+    local confirmed = false
+    for _ = 1, 3 do
+        local p = gpsPosition(5)
+
+        if p then
+            state.pos = p
+            state.lastGpsCheck = os.epoch("utc")
+            state.movesSinceGpsCheck = 0
+            save()
+
+            if samePos(p, state.home) then
+                confirmed = true
+                break
+            end
+
+            status("HOME_GPS_CORRECTING")
+            gotoXYZLowFirst(state.home)
+        else
+            sleep(1)
+        end
+    end
+
+    if not confirmed and state.pos and not samePos(state.pos, state.home) then
+        status("HOME_GPS_MISMATCH")
+        -- Final attempt using current GPS-corrected position.
+        if not gotoXYZLowFirst(state.home) then
+            status("HOME_CORRECTION_FAILED")
+            return false
+        end
+        setPosFromGps("HOME_GPS_RECHECK")
+    end
+
     turnTo(state.homeFacing or state.facing or "north")
 
     status("HOME_SERVICE")
@@ -1608,6 +1866,8 @@ local function mineLoop()
         end
 
         mergeFiller()
+
+        periodicGpsCheck()
 
         if needsService() then
             goHomeAndService("SERVICE_RETURN", true)
