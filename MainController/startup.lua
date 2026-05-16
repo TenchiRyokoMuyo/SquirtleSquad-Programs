@@ -3,7 +3,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "controller"
-local VERSION = "v2.0-loadout"
+local VERSION = "v2.1-fullpass"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MainController"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
@@ -50,6 +50,7 @@ local function defaultState()
     protected = { exact = {}, contains = {}, custom = {}, revision = 1 },
     settings = { gpsCheckMoves = 8, torchSpacing = 8 },
     killSwitch = { active = false, id = nil, startedAt = nil },
+    originLocks = {},
   }
   return s
 end
@@ -118,6 +119,7 @@ local function healState(s)
   s.logs = s.logs or {}
   s.settings = s.settings or d.settings
   s.killSwitch = s.killSwitch or d.killSwitch
+  s.originLocks = s.originLocks or {}
   state = s
   normalizeProtected()
 end
@@ -469,6 +471,8 @@ local function handleHeartbeat(id, p)
   if (a.role == "miner" or a.role == "foreman") and (a.protectedRevision or 0) < (state.protected.revision or 1) then sendProtected(id) end
 end
 
+local releaseMinerOriginLocks
+
 local function markTaskByMiner(minerId, status, problem)
   for _, job in pairs(state.jobs) do
     for _, t in ipairs(job.tasks or {}) do
@@ -477,6 +481,7 @@ local function markTaskByMiner(minerId, status, problem)
         if status == "COMPLETED" then t.completedAt = now() end
         if status == "PROBLEM" then t.problem = problem or "Unknown problem" end
         if state.agents[minerId] then state.agents[minerId].status = status == "COMPLETED" and "IDLE" or "PROBLEM"; state.agents[minerId].assignedTask = nil end
+        releaseMinerOriginLocks(minerId)
         checkJobCompletion(job)
         saveState()
         return true
@@ -486,12 +491,52 @@ local function markTaskByMiner(minerId, status, problem)
   return false
 end
 
+
+local function originLockKey(jobId)
+  return tostring(jobId or "global")
+end
+
+releaseMinerOriginLocks = function(minerId)
+  for k, l in pairs(state.originLocks or {}) do
+    if l.minerId == minerId then state.originLocks[k] = nil end
+  end
+end
+
+local function handleOriginLockRequest(id, p)
+  state.originLocks = state.originLocks or {}
+  local pl = p.payload or {}
+  local key = originLockKey(pl.jobId)
+  local existing = state.originLocks[key]
+  if not existing or existing.minerId == id or (now() - (existing.startedAt or 0)) > 120000 then
+    state.originLocks[key] = { minerId = id, taskId = pl.taskId, lockId = pl.lockId, startedAt = now(), pos = pl.pos }
+    if state.agents[id] then state.agents[id].status = "MOVING_TO_ORIGIN" end
+    send(id, { type="ORIGIN_LOCK_GRANTED", payload={ jobId=pl.jobId, taskId=pl.taskId, lockId=pl.lockId } })
+    log("Origin lock granted to " .. tostring(id) .. " for " .. tostring(pl.jobId))
+  else
+    send(id, { type="ORIGIN_LOCK_DENIED", payload={ jobId=pl.jobId, taskId=pl.taskId, lockId=pl.lockId, holder=existing.minerId } })
+  end
+  saveState()
+end
+
+local function handleOriginLockRelease(id, p)
+  local pl = p.payload or {}
+  local key = originLockKey(pl.jobId)
+  local existing = state.originLocks and state.originLocks[key]
+  if existing and existing.minerId == id then
+    state.originLocks[key] = nil
+    log("Origin lock released by " .. tostring(id) .. " for " .. tostring(pl.jobId))
+    saveState()
+  end
+end
+
 local function handlePacket(id, p)
   if not validPacket(p) then return end
   if p.type == "REGISTER" then handleRegister(id, p)
   elseif p.type == "HEARTBEAT" then handleHeartbeat(id, p)
   elseif p.type == "ANCHOR_REQUEST" then send(id, { type="ANCHOR_STATUS", payload=makeAnchorPayload() })
   elseif p.type == "PROTECTED_REQUEST" then sendProtected(id)
+  elseif p.type == "ORIGIN_LOCK_REQUEST" then handleOriginLockRequest(id, p)
+  elseif p.type == "ORIGIN_LOCK_RELEASE" then handleOriginLockRelease(id, p)
   elseif p.type == "TASK_COMPLETE" then markTaskByMiner(id, "COMPLETED")
   elseif p.type == "TASK_PROBLEM" then markTaskByMiner(id, "PROBLEM", p.payload and p.payload.reason)
   elseif p.type == "ROGUE" then
@@ -598,6 +643,7 @@ local function killSwitch()
   if read() ~= "KILL" then return end
   state.killSwitch = { active=true, id=makeId("kill"), startedAt=now() }
   saveState()
+  state.originLocks = {}
   broadcast({ type="EMERGENCY_STOP_RETURN", payload={ killId=state.killSwitch.id, reason="controller_kill_switch" } })
   log("KILL SWITCH ACTIVATED " .. state.killSwitch.id)
   print("Kill switch broadcast.")
