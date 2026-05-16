@@ -1,247 +1,65 @@
--- SquirtleSquad-Miner v1.1
--- ForemanTurtle/startup.lua
--- Patch focus:
---   * Avoid endless spin-panic by limiting follow attempts and waiting when blocked.
---   * Track a home position on first calibration and obey GO_HOME.
---   * Preserve no-dig support behavior.
+-- SquirtleSquad ForemanTurtle.lua
+-- Optional support turtle. Never required for mining.
 
-local PROTOCOL="TurtleTeamNet"
 local PROJECT="SquirtleSquad-Miner"
-local VERSION="v1.1"
-local DATA_DIR="SquirtleSquadData"
+local ROLE="foreman"
+local VERSION="v2.0-loadout"
+local PROTOCOL="TurtleTeamNet"
+local DATA_DIR="SquirtleSquadData/ForemanTurtle"
 local STATE_FILE=DATA_DIR.."/foreman_state.dat"
+local HEARTBEAT_INTERVAL=5
+local DIRS={north={dx=0,dz=-1},east={dx=1,dz=0},south={dx=0,dz=1},west={dx=-1,dz=0}}
+local ORDER={"north","east","south","west"}
 
-local state={
-  role="foreman", label="Foreman-"..os.getComputerID(), controllerId=nil, agentId=nil,
-  status="BOOTING", teamId=nil, minerId=nil, minerNet=nil, jobId=nil, sector=nil,
-  deployHold=true, pos=nil, facing="north", calibrated=false, paused=false,
-  home=nil, homeFacing=nil, forceHome=false
-}
-
-local running=true
+local state={version=VERSION,id=os.getComputerID(),label=os.getComputerLabel(),controllerId=nil,status="BOOTING",home=nil,homeFacing=nil,pos=nil,facing=nil,gpsValid=false,atHome=false,assignedMiner=nil,job=nil,rogue=false,lastProblem=nil}
 local modemSide=nil
-local lastMinerPos=nil
-local lastMinerFacing="north"
+local running=true
+local phase="idle"
 
-local DIRS={
-  north={x=0,z=-1,left="west",right="east",back="south"},
-  east ={x=1,z=0,left="north",right="south",back="west"},
-  south={x=0,z=1,left="east",right="west",back="north"},
-  west ={x=-1,z=0,left="south",right="north",back="east"},
-}
-
-local function ensureDir() if not fs.exists(DATA_DIR) then fs.makeDir(DATA_DIR) end end
-local function save() ensureDir(); local h=fs.open(STATE_FILE,"w"); if h then h.write(textutils.serialize(state)); h.close() end end
-local function load()
-  if fs.exists(STATE_FILE) then
-    local h=fs.open(STATE_FILE,"r")
-    if h then local txt=h.readAll(); h.close(); local ok,t=pcall(textutils.unserialize,txt); if ok and type(t)=="table" then for k,v in pairs(t) do state[k]=v end end end
-  end
-end
-local function clonePos(p) if not p then return nil end return {x=p.x,y=p.y,z=p.z} end
-local function openModem()
-  for _,side in ipairs(peripheral.getNames()) do
-    if peripheral.getType(side)=="modem" then modemSide=side; if not rednet.isOpen(side) then rednet.open(side) end; return true end
-  end
-  return false
-end
-local function send(msg) if not modemSide then return end msg.project=PROJECT; msg.version=VERSION; if state.controllerId then rednet.send(state.controllerId,msg,PROTOCOL) else rednet.broadcast(msg,PROTOCOL) end end
-local function sendTo(id,msg) if id then msg.project=PROJECT; msg.version=VERSION; rednet.send(id,msg,PROTOCOL) end end
-local function status(s) state.status=s; save() end
-
-local function header()
-  term.clear(); term.setCursorPos(1,1)
-  if term.isColor() then term.setTextColor(colors.cyan) end
-  print(" "..PROJECT.." "..VERSION.." ")
-  if term.isColor() then term.setTextColor(colors.white) end
-  print("Foreman Turtle: "..tostring(state.label))
-  print("Status: "..tostring(state.status))
-  print("Team: "..tostring(state.teamId or "none"))
-  print("MinerNet: "..tostring(state.minerNet or "none"))
-  if state.pos then print("Pos: "..state.pos.x..","..state.pos.y..","..state.pos.z.." facing "..tostring(state.facing)) end
-  if lastMinerPos then print("Miner: "..lastMinerPos.x..","..lastMinerPos.y..","..lastMinerPos.z.." facing "..tostring(lastMinerFacing)) end
-  if state.home then print("Home: "..state.home.x..","..state.home.y..","..state.home.z) end
-  print("")
-end
-
-local function refuelIfNeeded()
-  if turtle.getFuelLevel()=="unlimited" then return true end
-  if turtle.getFuelLevel()>200 then return true end
-  turtle.select(1)
-  if turtle.getItemCount(1)>0 then turtle.refuel(math.min(8,turtle.getItemCount(1))) end
-  return turtle.getFuelLevel()=="unlimited" or turtle.getFuelLevel()>50
-end
-
-local function turnLeft() turtle.turnLeft(); state.facing=DIRS[state.facing].left; save() end
-local function turnRight() turtle.turnRight(); state.facing=DIRS[state.facing].right; save() end
-local function turnTo(dir)
-  if not dir then return end
-  local g=0
-  while state.facing~=dir and g<4 do turnRight(); g=g+1 end
-end
-local function updateForward() local d=DIRS[state.facing]; state.pos.x=state.pos.x+d.x; state.pos.z=state.pos.z+d.z end
-local function updateBack() local d=DIRS[state.facing]; state.pos.x=state.pos.x-d.x; state.pos.z=state.pos.z-d.z end
-
-local function safeForward()
-  refuelIfNeeded()
-  for _=1,2 do if turtle.forward() then updateForward(); save(); return true end sleep(0.25) end
-  return false
-end
-local function safeBack()
-  refuelIfNeeded()
-  for _=1,2 do if turtle.back() then updateBack(); save(); return true end sleep(0.25) end
-  return false
-end
-local function safeUp() refuelIfNeeded(); if turtle.up() then state.pos.y=state.pos.y+1; save(); return true end return false end
-local function safeDown() refuelIfNeeded(); if turtle.down() then state.pos.y=state.pos.y-1; save(); return true end return false end
-
-local function calibrate()
-  status("WAITING_FOR_GPS")
-  while not state.calibrated do
-    local x,y,z=gps.locate(10)
-    if x and y and z then
-      state.pos={x=math.floor(x+0.5),y=math.floor(y+0.5),z=math.floor(z+0.5)}
-      state.facing=state.facing or "north"
-      state.calibrated=true
-      if not state.home then state.home=clonePos(state.pos); state.homeFacing=state.facing end
-      save(); status("CALIBRATED"); return true
-    end
-    if state.pos then
-      state.calibrated=true
-      if not state.home then state.home=clonePos(state.pos); state.homeFacing=state.facing end
-      save(); status("RECOVERED_DEAD_RECKONING"); return true
-    end
-    sleep(3)
-  end
-end
-
-local function goY(y)
-  while state.pos.y<y do if not safeUp() then return false end end
-  while state.pos.y>y do if not safeDown() then return false end end
-  return true
-end
-local function goX(x)
-  if state.pos.x<x then turnTo("east"); while state.pos.x<x do if not safeForward() then return false end end
-  elseif state.pos.x>x then turnTo("west"); while state.pos.x>x do if not safeForward() then return false end end end
-  return true
-end
-local function goZ(z)
-  if state.pos.z<z then turnTo("south"); while state.pos.z<z do if not safeForward() then return false end end
-  elseif state.pos.z>z then turnTo("north"); while state.pos.z>z do if not safeForward() then return false end end end
-  return true
-end
-local function gotoXYZ(p)
-  if not p or not state.pos then return false end
-  local travelY=math.max(state.pos.y,p.y)
-  if not goY(travelY) then return false end
-  if not goX(p.x) then return false end
-  if not goZ(p.z) then return false end
-  if not goY(p.y) then return false end
-  return true
-end
-
-local function manhattan(a,b) return math.abs(a.x-b.x)+math.abs(a.y-b.y)+math.abs(a.z-b.z) end
-local function sideOfMiner(minerPos, minerFacing)
-  local f=minerFacing or "north"
-  local side=DIRS[f].right
-  local d=DIRS[side]
-  return {x=minerPos.x+d.x, y=minerPos.y, z=minerPos.z+d.z}
-end
-
-local function trySingleStepToward(target)
-  if not target or not state.pos then return false end
-  local dx,dy,dz=target.x-state.pos.x,target.y-state.pos.y,target.z-state.pos.z
-  if math.abs(dy)>0 and math.abs(dy)>=math.abs(dx) and math.abs(dy)>=math.abs(dz) then
-    if dy>0 then return safeUp() else return safeDown() end
-  end
-  if math.abs(dx)>=math.abs(dz) and dx~=0 then
-    turnTo(dx>0 and "east" or "west")
-    return safeForward()
-  elseif dz~=0 then
-    turnTo(dz>0 and "south" or "north")
-    return safeForward()
-  end
-  return true
-end
-
-local function maintainSide()
-  if not lastMinerPos or not state.pos then return end
-  local target=sideOfMiner(lastMinerPos,lastMinerFacing)
-  local dist=manhattan(state.pos,target)
-  if dist<=2 then status("FOLLOWING"); return end
-
-  status("RETURNING_TO_MINER")
-  -- Bounded follow: no endless spin. Try a few direct steps, then wait for the miner to move/clear path.
-  for _=1,6 do
-    if manhattan(state.pos,target)<=2 then status("FOLLOWING"); return true end
-    if not trySingleStepToward(target) then
-      status("WAITING_NEAR_MINER")
-      return false
-    end
-  end
-  status("WAITING_NEAR_MINER")
-  return false
-end
-
-local function moveAside()
-  status("MOVING_ASIDE")
-  if safeBack() then sendTo(state.minerNet,{type="FOREMAN_MOVED",teamId=state.teamId}); status("FOLLOWING"); return true end
-  turnRight()
-  if safeForward() then turnLeft(); sendTo(state.minerNet,{type="FOREMAN_MOVED",teamId=state.teamId}); status("FOLLOWING"); return true end
-  turnLeft()
-  if safeUp() then sendTo(state.minerNet,{type="FOREMAN_MOVED",teamId=state.teamId}); status("FOLLOWING"); return true end
-  sendTo(state.minerNet,{type="FOREMAN_MOVED",teamId=state.teamId,failed=true})
-  status("WAITING_NEAR_MINER")
-  return false
-end
-
-local function goHome()
-  if not state.home then status("NO_HOME_SET"); return false end
-  status("GOING_HOME")
-  local ok=gotoXYZ(state.home)
-  if ok then turnTo(state.homeFacing or state.facing); status("AT_HOME") else status("HOME_PATH_FAILED") end
-  return ok
-end
-
-local function networkLoop()
-  while running do
-    local sender,msg,proto=rednet.receive(PROTOCOL,1)
-    if type(msg)=="table" then
-      if msg.type=="REGISTER_ACK" then state.controllerId=sender; state.agentId=msg.agentId; save()
-      elseif msg.type=="ASSIGN_FOREMAN" then
-        state.controllerId=sender; state.teamId=msg.teamId; state.minerId=msg.minerId; state.minerNet=msg.minerNet; state.jobId=msg.jobId; state.sector=msg.sector; state.deployHold=true; state.forceHome=false; save(); status("ASSIGNED")
-      elseif msg.type=="DEPLOY_NOW" and (not msg.teamId or msg.teamId==state.teamId) then state.deployHold=false; save(); status("DEPLOY_RELEASED")
-      elseif msg.type=="MINER_POSITION" or msg.type=="MINER_MOVED_FORWARD" or msg.type=="MINER_MOVED_UP" or msg.type=="MINER_MOVED_DOWN" then if msg.pos then lastMinerPos=msg.pos; lastMinerFacing=msg.facing or lastMinerFacing; maintainSide() end
-      elseif msg.type=="MINER_TURNED_LEFT" or msg.type=="MINER_TURNED_RIGHT" then if msg.pos then lastMinerPos=msg.pos; lastMinerFacing=msg.facing or lastMinerFacing end
-      elseif msg.type=="FOREMAN_MOVE_REQUEST" then lastMinerPos=msg.pos or lastMinerPos; lastMinerFacing=msg.facing or lastMinerFacing; moveAside()
-      elseif msg.type=="SERVICE_RETURN" then status("RETURNING_WITH_MINER")
-      elseif msg.type=="GO_HOME" then state.forceHome=true; save(); status("GO_HOME_REQUESTED")
-      elseif msg.type=="PAUSE_JOB" then state.paused=true; save(); status("PAUSED")
-      elseif msg.type=="RESUME_JOB" then state.paused=false; save(); status("FOLLOWING")
-      elseif msg.type=="CANCEL_JOB" then state.teamId=nil; state.minerNet=nil; state.jobId=nil; state.sector=nil; state.forceHome=true; save(); status("CANCELLED_GOING_HOME")
-      elseif msg.type=="ROLL_CALL" then send({type="ROLL_CALL_RESPONSE",role="foreman",status=state.status,x=state.pos and state.pos.x,y=state.pos and state.pos.y,z=state.pos and state.pos.z})
-      end
-    end
-  end
-end
-
-local function heartbeatLoop()
-  while running do
-    send({type="REGISTER",role="foreman",label=state.label,status=state.status,x=state.pos and state.pos.x,y=state.pos and state.pos.y,z=state.pos and state.pos.z})
-    send({type="HEARTBEAT",role="foreman",label=state.label,status=state.status,x=state.pos and state.pos.x,y=state.pos and state.pos.y,z=state.pos and state.pos.z,facing=state.facing})
-    sleep(10)
-  end
-end
-local function displayLoop() while running do header(); sleep(2) end end
-local function workLoop()
-  calibrate()
-  while running do
-    if state.forceHome then state.forceHome=false; save(); goHome()
-    elseif state.teamId and state.deployHold then status("WAITING_DEPLOY"); sleep(1)
-    elseif state.teamId then maintainSide(); sleep(2)
-    else status("LISTENING"); sleep(3) end
-  end
-end
-
-ensureDir(); load(); openModem(); save()
-parallel.waitForAny(networkLoop,heartbeatLoop,displayLoop,workLoop)
+local function ensureDir() if not fs.exists("SquirtleSquadData") then fs.makeDir("SquirtleSquadData") end if not fs.exists(DATA_DIR) then fs.makeDir(DATA_DIR) end end
+local function copy(t) if type(t)~="table" then return t end local r={} for k,v in pairs(t) do r[k]=copy(v) end return r end
+local function saveTable(path,t) ensureDir(); local h=fs.open(path,"w"); if not h then return false end h.write(textutils.serialize(t)); h.close(); return true end
+local function loadTable(path) if not fs.exists(path) then return nil end local h=fs.open(path,"r"); if not h then return nil end local s=h.readAll(); h.close(); local ok,t=pcall(textutils.unserialize,s or ""); if ok and type(t)=="table" then return t end return nil end
+local function saveState() state.version=VERSION; state.label=os.getComputerLabel(); saveTable(STATE_FILE,state) end
+local function loadState() local s=loadTable(STATE_FILE); if type(s)=="table" then for k,v in pairs(s) do state[k]=v end end end
+local function now() return os.epoch("utc") end
+local function color(c) if term.isColor and term.isColor() then term.setTextColor(c) end end
+local function bcolor(c) if term.isColor and term.isColor() then term.setBackgroundColor(c) end end
+local function clear() bcolor(colors.black); color(colors.lightGray); term.clear(); term.setCursorPos(1,1) end
+local function center(y,text,c) local w=term.getSize(); color(c or colors.lightGray); term.setCursorPos(math.max(1,math.floor((w-#text)/2)+1),y); term.write(text) end
+local function header(title) clear(); center(1,"SquirtleSquad Foreman",colors.cyan); center(2,title or VERSION,colors.orange); term.setCursorPos(1,4); color(colors.lightGray) end
+local function writeCoord(c) if not c then color(colors.red); term.write("unknown"); color(colors.lightGray); return end color(colors.red); term.write("X "..c.x.." "); color(colors.yellow); term.write("Y "..c.y.." "); color(colors.blue); term.write("Z "..c.z); color(colors.lightGray) end
+local function openModem() for _,n in ipairs(peripheral.getNames()) do if peripheral.getType(n)=="modem" then modemSide=n; if not rednet.isOpen(n) then rednet.open(n) end; return true end end return false end
+local function safePacket(packet) if type(packet)~="table" then return nil end local p=copy(packet); p.project=PROJECT; p.protocol=PROTOCOL; p.protocolVersion=2; p.senderRole=ROLE; p.senderId=os.getComputerID(); p.timestamp=now(); p.payload=p.payload or {}; if not pcall(textutils.serialize,p) then return nil end return p end
+local function send(id,p) local q=safePacket(p); if not q then return false end return rednet.send(id,q,PROTOCOL) end
+local function broadcast(p) local q=safePacket(p); if not q then return false end rednet.broadcast(q,PROTOCOL); return true end
+local function validPacket(p) return type(p)=="table" and p.project==PROJECT and p.protocol==PROTOCOL and type(p.type)=="string" end
+local function locate(timeout) local x,y,z=gps.locate(timeout or 2); if x then return {x=math.floor(x+0.5),y=math.floor(y+0.5),z=math.floor(z+0.5)} end return nil end
+local function requestAnchors() if state.controllerId then send(state.controllerId,{type="ANCHOR_REQUEST",payload={}}) else broadcast({type="ANCHOR_REQUEST",payload={}}) end local deadline=os.clock()+8 while os.clock()<deadline do local id,msg=rednet.receive(PROTOCOL,1); if id and validPacket(msg) then if msg.type=="ANCHOR_STATUS" then state.controllerId=id; return msg.payload elseif msg.type=="REGISTER_ACK" then state.controllerId=id; return msg.payload and msg.payload.anchors end end end return nil end
+local function gpsQuorum() local p=locate(2); state.gpsValid=false; if not p then return false,"gps.locate failed" end local a=requestAnchors(); if not a or not a.ok or (a.gpsSubhosts or 0)<3 then return false,"4 GPS anchors unavailable" end state.pos=p; state.gpsValid=true; saveState(); return true end
+local function samePos(a,b) return a and b and a.x==b.x and a.y==b.y and a.z==b.z end
+local function faceIndex(f) for i,v in ipairs(ORDER) do if v==f then return i end end return 1 end
+local function turnLeft() turtle.turnLeft(); state.facing=ORDER[((faceIndex(state.facing)-2)%4)+1]; saveState() end
+local function turnRight() turtle.turnRight(); state.facing=ORDER[(faceIndex(state.facing)%4)+1]; saveState() end
+local function face(f) while state.facing~=f do local ci,ti=faceIndex(state.facing),faceIndex(f); if ((ti-ci)%4)==1 then turnRight() else turnLeft() end end end
+local function targetForward() local d=DIRS[state.facing]; return {x=state.pos.x+d.dx,y=state.pos.y,z=state.pos.z+d.dz} end
+local function promptFacing() while true do header("Home Facing"); print("1 north\n2 east\n3 south\n4 west"); local n=tonumber(read()); if n and ORDER[n] then return ORDER[n] end end end
+local function heartbeat() local pl={role=ROLE,status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.home~=nil,inventoryValid=true,gpsValid=state.gpsValid,atHome=samePos(state.pos,state.home),assignedMiner=state.assignedMiner,rogue=state.rogue}; if state.controllerId then send(state.controllerId,{type="HEARTBEAT",payload=pl}) else broadcast({type="HEARTBEAT",payload=pl}) end end
+local function register() broadcast({type="REGISTER",payload={role=ROLE,label=os.getComputerLabel(),status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.home~=nil,inventoryValid=true,gpsValid=state.gpsValid,atHome=samePos(state.pos,state.home)}}) end
+local function markProblem(reason) state.status="PROBLEM"; state.lastProblem=reason; saveState(); if state.controllerId then send(state.controllerId,{type="TASK_PROBLEM",payload={reason=reason,pos=copy(state.pos)}}) end end
+local function markRogue(reason) state.rogue=true; state.status="ROGUE"; state.lastProblem=reason; saveState(); pcall(os.setComputerLabel,"ROGUE-Foreman-"..os.getComputerID()); if state.controllerId then send(state.controllerId,{type="ROGUE",payload={reason=reason,pos=copy(state.pos)}}) else broadcast({type="ROGUE",payload={reason=reason,pos=copy(state.pos)}}) end error("ROGUE: "..tostring(reason),0) end
+local function allowedTarget(p) if phase=="to_home" or phase=="follow" then return true end return true end
+local function moveForward(reason) if not gpsQuorum() then markProblem("GPS_LOST"); return false end local target=targetForward(); if not allowedTarget(target) then markProblem("Target outside allowed area"); return false end if turtle.detect() then return false end if turtle.forward() then state.pos=target; saveState(); return true end return false end
+local function moveUp() if not gpsQuorum() then return false end if turtle.detectUp() then return false end if turtle.up() then state.pos={x=state.pos.x,y=state.pos.y+1,z=state.pos.z}; saveState(); return true end return false end
+local function moveDown() if not gpsQuorum() then return false end if turtle.detectDown() then return false end if turtle.down() then state.pos={x=state.pos.x,y=state.pos.y-1,z=state.pos.z}; saveState(); return true end return false end
+local function goY(y) while state.pos.y<y do if not moveUp() then return false end end while state.pos.y>y do if not moveDown() then return false end end return true end
+local function goX(x) while state.pos.x<x do face("east"); if not moveForward("x") then return false end end while state.pos.x>x do face("west"); if not moveForward("x") then return false end end return true end
+local function goZ(z) while state.pos.z<z do face("south"); if not moveForward("z") then return false end end while state.pos.z>z do face("north"); if not moveForward("z") then return false end end return true end
+local function goTo(p) if not gpsQuorum() then return false end if not goY(p.y) then return false end if not goX(p.x) then return false end if not goZ(p.z) then return false end return gpsQuorum() end
+local function returnHome(reason) state.status="RETURNING"; phase="to_home"; saveState(); if not state.home or not goTo(state.home) or not samePos(state.pos,state.home) then markRogue(reason or "Unable to return home") end face(state.homeFacing); state.status="AT_HOME"; phase="idle"; saveState(); heartbeat() end
+local function handlePacket(id,msg) if not validPacket(msg) then return end if msg.type=="REGISTER_ACK" then state.controllerId=id; saveState() elseif msg.type=="ROLL_CALL" then heartbeat() elseif msg.type=="GO_HOME" then returnHome("Controller ordered home") elseif msg.type=="EMERGENCY_STOP_RETURN" then returnHome("Controller kill switch") elseif msg.type=="FOREMAN_ASSIGN" then state.controllerId=id; state.assignedMiner=msg.payload and msg.payload.minerId; state.job=msg.payload and msg.payload.job; state.status="ASSIGNED"; saveState(); heartbeat() end end
+local function networkLoop() while running do local id,msg=rednet.receive(PROTOCOL,1); if id then handlePacket(id,msg) end end end
+local function heartbeatLoop() while running do heartbeat(); sleep(HEARTBEAT_INTERVAL) end end
+local function displayLoop() while running do header("Status"); print("ID: "..os.getComputerID()); print("Status: "..tostring(state.status)); term.write("Pos: "); writeCoord(state.pos); print(""); term.write("Home: "); writeCoord(state.home); print(""); print("Assigned miner: "..tostring(state.assignedMiner)); print("GPS: "..tostring(state.gpsValid)); sleep(2) end end
+local function boot() ensureDir(); loadState(); header("Boot"); if not openModem() then print("No modem found."); return false end local ok,why=gpsQuorum(); if not ok then print("GPS invalid: "..tostring(why)); return false end if state.rogue then if state.home and samePos(state.pos,state.home) then state.rogue=false; state.status="AT_HOME"; pcall(os.setComputerLabel,"Foreman-"..os.getComputerID()); saveState() else print("Rogue lock. Place at home and reboot."); return false end end if not state.home then state.home=copy(state.pos); state.homeFacing=promptFacing(); state.facing=state.homeFacing end state.status=samePos(state.pos,state.home) and "AT_HOME" or "WAITING"; saveState(); register(); return true end
+if boot() then parallel.waitForAny(networkLoop,heartbeatLoop,displayLoop) end
