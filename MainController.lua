@@ -35,6 +35,8 @@ local modemSide = nil
 local running = true
 local gpsProcessStarted = false
 local uiBusy = false
+local gpsHostStatus = "stopped"
+local gpsRequestsLabel = "GPS requests handled: hidden"
 
 local function defaultState()
   local s = {
@@ -118,6 +120,8 @@ local function healState(s)
   s.queuedJobs = s.queuedJobs or {}
   s.logs = s.logs or {}
   s.settings = s.settings or d.settings
+  if s.settings.gpsCheckMoves == nil then s.settings.gpsCheckMoves = d.settings.gpsCheckMoves end
+  if s.settings.torchSpacing == nil then s.settings.torchSpacing = d.settings.torchSpacing end
   s.killSwitch = s.killSwitch or d.killSwitch
   s.originLocks = s.originLocks or {}
   state = s
@@ -205,6 +209,20 @@ local function writeCoord(c)
   color(colors.blue); term.write("Z " .. tostring(c.z))
   color(colors.lightGray)
 end
+
+local function printCoord(c)
+  writeCoord(c)
+  print("")
+end
+
+local function writeAxis(axis, suffix)
+  if axis == "X" then color(colors.red)
+  elseif axis == "Y" then color(colors.yellow)
+  elseif axis == "Z" then color(colors.blue)
+  else color(colors.lightGray) end
+  term.write(axis .. tostring(suffix or ""))
+  color(colors.lightGray)
+end
 local function header(title)
   clear(); center(1, "SquirtleSquad Main Controller", colors.cyan); center(2, title or VERSION, colors.orange); term.setCursorPos(1,4); color(colors.lightGray)
 end
@@ -256,9 +274,22 @@ local function promptNumber(label, default)
     print("Enter a number.")
   end
 end
+local function promptAxis(axis, default)
+  while true do
+    writeAxis(axis)
+    if default ~= nil then term.write(" [" .. tostring(default) .. "]") end
+    term.write(": ")
+    local s = read()
+    if s == "" and default ~= nil then return default end
+    local n = tonumber(s)
+    if n then return n end
+    print("Enter a number.")
+  end
+end
+
 local function promptCoord(name)
   print("Enter " .. name .. ":")
-  return { x = promptNumber("X"), y = promptNumber("Y"), z = promptNumber("Z") }
+  return { x = promptAxis("X"), y = promptAxis("Y"), z = promptAxis("Z") }
 end
 local function makeId(prefix) return prefix .. "-" .. tostring(os.epoch("utc")) .. "-" .. tostring(math.random(1000,9999)) end
 
@@ -411,7 +442,66 @@ local function compactJob(job)
   }
 end
 
+local function removeValue(list, value)
+  local i = 1
+  while i <= #list do
+    if list[i] == value then table.remove(list, i) else i = i + 1 end
+  end
+end
+
+local function cleanupJobLists()
+  local function keepRunnable(id)
+    local job = state.jobs[id]
+    return job and job.status ~= "CANCELLED" and job.status ~= "COMPLETED" and job.status ~= "DELETED"
+  end
+  local function clean(list)
+    local i = 1
+    while i <= #list do
+      if keepRunnable(list[i]) then i = i + 1 else table.remove(list, i) end
+    end
+  end
+  clean(state.activeJobs)
+  clean(state.queuedJobs)
+end
+
+local function runnableActiveJobCount()
+  cleanupJobLists()
+  local n = 0
+  for _, id in ipairs(state.activeJobs) do
+    local job = state.jobs[id]
+    if job and job.status ~= "CANCELLED" and job.status ~= "COMPLETED" and job.status ~= "PROBLEM" then n = n + 1 end
+  end
+  return n
+end
+
+local function promoteQueuedJobs()
+  cleanupJobLists()
+  if runnableActiveJobCount() > 0 then return end
+  while #state.queuedJobs > 0 do
+    local id = table.remove(state.queuedJobs, 1)
+    local job = state.jobs[id]
+    if job and job.status == "QUEUED" then
+      job.status = "ACTIVE"
+      table.insert(state.activeJobs, id)
+      log("Promoted queued job " .. tostring(id) .. " to ACTIVE")
+      break
+    end
+  end
+end
+
+local function deleteJob(jobId)
+  local job = state.jobs[jobId]
+  if not job then return false end
+  if job.status == "ACTIVE" or job.status == "PAUSED" then return false end
+  removeValue(state.activeJobs, jobId)
+  removeValue(state.queuedJobs, jobId)
+  state.jobs[jobId] = nil
+  return true
+end
+
 local function assignTasks()
+  promoteQueuedJobs()
+  cleanupJobLists()
   for _, jobId in ipairs(state.activeJobs) do
     local job = state.jobs[jobId]
     if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
@@ -441,7 +531,10 @@ local function checkJobCompletion(job)
   end
   if not anyQueued and not anyProgress then
     job.status = anyProblem and "PROBLEM" or "COMPLETED"
+    removeValue(state.activeJobs, job.id)
+    removeValue(state.queuedJobs, job.id)
     log("Job " .. job.id .. " " .. job.status)
+    promoteQueuedJobs()
   end
 end
 
@@ -562,8 +655,16 @@ end
 local function gpsHostLoop()
   while running do
     if state.gps and state.gps.hostEnabled and state.gps.x and state.gps.y and state.gps.z then
+      gpsHostStatus = "active"
+      local old = termNative
+      local w, h = old.getSize()
+      local hidden = window.create(old, w, h, 1, 1, false)
+      term.redirect(hidden)
       shell.run("gps", "host", tostring(state.gps.x), tostring(state.gps.y), tostring(state.gps.z))
+      term.redirect(old)
+      gpsHostStatus = "stopped"
     else
+      gpsHostStatus = "waiting for coords"
       sleep(1)
     end
   end
@@ -580,6 +681,11 @@ local function drawDashboard()
   if not monitor then return end
   local old = term.redirect(monitor)
   header("Dashboard")
+  local w, h = term.getSize()
+  local gpsText = "GPS host: " .. tostring(gpsHostStatus)
+  term.setCursorPos(math.max(1, w - #gpsText + 1), 1)
+  color(colors.yellow); term.write(gpsText); color(colors.lightGray)
+  term.setCursorPos(1,4)
   print("ID: " .. os.getComputerID() .. " Modem: " .. tostring(modemSide or "missing"))
   term.write("GPS: "); writeCoord(state.gps.x and state.gps or nil); print("")
   local miners, foremen, gpss, rogue = 0,0,0,0
@@ -590,12 +696,11 @@ local function drawDashboard()
     if a.status == "ROGUE" then rogue=rogue+1 end
   end
   print("Miners: "..miners.." Foremen: "..foremen.." GPS Subhosts: "..gpss.." Rogue: "..rogue)
-  print("Active jobs: " .. #state.activeJobs .. " Queued jobs: " .. #state.queuedJobs)
+  print("Active jobs: " .. runnableActiveJobCount() .. " Queued jobs: " .. #state.queuedJobs)
   print("Protected rev: " .. tostring(state.protected.revision))
   if state.killSwitch.active then color(colors.red); print("KILL SWITCH ACTIVE " .. tostring(state.killSwitch.id)); color(colors.lightGray) end
   print("")
   print("Recent logs:")
-  local _, h = term.getSize()
   local start = math.max(1, #state.logs - (h - 9))
   for i=start,#state.logs do print(string.sub(state.logs[i],1,80)) end
   term.redirect(old)
@@ -621,13 +726,25 @@ local function viewFleet(role)
   local items = {}
   for id, a in pairs(state.agents) do
     if not role or a.role == role then
-      table.insert(items, { label = tostring(id) .. " " .. tostring(a.role) .. " " .. tostring(a.status or "?") .. " " .. (a.pos and ("@ "..a.pos.x..","..a.pos.y..","..a.pos.z) or ""), status=a.status })
+      table.insert(items, { label = tostring(id) .. " " .. tostring(a.role) .. " " .. tostring(a.status or "?"), agent=a, id=id, status=a.status })
     end
   end
   table.sort(items, function(a,b) return a.label < b.label end)
   if #items == 0 then header("Fleet"); print("No agents."); press(); return end
   table.insert(items, {label="Back"})
-  choose("Fleet", items)
+  local it = choose("Fleet", items)
+  if it and it.agent then
+    header("Fleet Agent")
+    print("ID: " .. tostring(it.id))
+    print("Role: " .. tostring(it.agent.role))
+    print("Status: " .. tostring(it.agent.status))
+    term.write("Pos: "); writeCoord(it.agent.pos); print("")
+    term.write("Home: "); writeCoord(it.agent.home); print("")
+    print("GPS valid: " .. tostring(it.agent.gpsValid))
+    print("Home valid: " .. tostring(it.agent.homeValid))
+    print("Inventory valid: " .. tostring(it.agent.inventoryValid))
+    press()
+  end
 end
 
 local function sendAllTurtlesHome()
@@ -730,7 +847,7 @@ local function createJob()
   elseif job.shape == "stretched_cylinder" then
     job.origin = promptCoord("origin x y z / pathing origin")
     print("Second origin uses x2 and z2. y2 = y.")
-    job.origin2 = { x=promptNumber("X2"), y=job.origin.y, z=promptNumber("Z2") }
+    job.origin2 = { x=promptAxis("X", nil), y=job.origin.y, z=promptAxis("Z", nil) }
     job.radius = promptNumber("Radius")
     job.layerHeight = promptNumber("Layer height", 1)
   elseif job.shape == "tunnel_spline" then
@@ -741,9 +858,10 @@ local function createJob()
     job.layerHeight = promptNumber("Layer height", 3)
   end
   job.torchMode = askTorchMode(job.layerHeight or 1)
+  cleanupJobLists()
   createTasks(job)
   state.jobs[job.id] = job
-  local activeCount = #state.activeJobs
+  local activeCount = runnableActiveJobCount()
   if activeCount > 0 then
     local run = choose("Job Scheduling", {{label="Queue after current active job"},{label="Run simultaneously"}})
     if run and run.label == "Run simultaneously" then table.insert(state.activeJobs, job.id); job.status="ACTIVE" else table.insert(state.queuedJobs, job.id); job.status="QUEUED" end
@@ -778,15 +896,38 @@ local function viewJobs()
 end
 
 local function pauseResumeCancel(action)
+  cleanupJobLists()
   local items = {}
-  for id, job in pairs(state.jobs) do if job.status ~= "COMPLETED" and job.status ~= "CANCELLED" then table.insert(items,{label=id .. " " .. job.status, job=job}) end end
+  for id, job in pairs(state.jobs) do
+    if job.status ~= "COMPLETED" and job.status ~= "CANCELLED" then
+      table.insert(items,{label=id .. " " .. job.status, job=job})
+    end
+  end
   table.insert(items,{label="Back"})
   local it = choose(action .. " Job", items)
   if not it or not it.job then return end
   local job = it.job
-  if action == "Pause" then job.status="PAUSED"; broadcast({type="PAUSE_JOB",payload={jobId=job.id}})
-  elseif action == "Resume" then job.status="ACTIVE"; broadcast({type="RESUME_JOB",payload={jobId=job.id}})
-  elseif action == "Cancel" then job.status="CANCELLED"; broadcast({type="CANCEL_JOB",payload={jobId=job.id}}) end
+  if action == "Pause" then
+    job.status="PAUSED"
+    broadcast({type="PAUSE_JOB",payload={jobId=job.id}})
+  elseif action == "Resume" then
+    job.status="ACTIVE"
+    if not state.activeJobs then state.activeJobs = {} end
+    table.insert(state.activeJobs, job.id)
+    removeValue(state.queuedJobs, job.id)
+    broadcast({type="RESUME_JOB",payload={jobId=job.id}})
+  elseif action == "Cancel" then
+    job.status="CANCELLED"
+    removeValue(state.activeJobs, job.id)
+    removeValue(state.queuedJobs, job.id)
+    for _, t in ipairs(job.tasks or {}) do
+      if t.status == "QUEUED" then t.status = "CANCELLED" end
+      if t.status == "IN_PROGRESS" then t.status = "CANCELLED" end
+    end
+    broadcast({type="CANCEL_JOB",payload={jobId=job.id}})
+    promoteQueuedJobs()
+  end
+  cleanupJobLists()
   saveState(); log(action .. " job " .. job.id)
 end
 
@@ -802,16 +943,75 @@ local function resetProblemTask()
   if it and it.task then it.task.status="QUEUED"; it.task.problem=nil; it.task.minerId=nil; saveState(); log("Reset task "..it.task.id); assignTasks() end
 end
 
+local function deleteSpecificHistoryJob()
+  cleanupJobLists()
+  local items = {}
+  for id, job in pairs(state.jobs) do
+    if job.status == "CANCELLED" or job.status == "COMPLETED" or job.status == "PROBLEM" then
+      table.insert(items, { label = id .. " " .. tostring(job.shape) .. " " .. tostring(job.status), job = job, status = job.status })
+    end
+  end
+  table.sort(items, function(a,b) return a.label < b.label end)
+  table.insert(items, { label = "Back" })
+  local it = choose("Delete Job From History", items, "Deletes the selected job record. Tasks are not individually editable.")
+  if not it or not it.job then return end
+  header("Delete Job")
+  print("Delete job " .. it.job.id .. "?")
+  print("Type DELETE to confirm.")
+  if read() == "DELETE" then
+    if deleteJob(it.job.id) then
+      saveState()
+      log("Deleted history job " .. it.job.id)
+    else
+      print("Job could not be deleted because it is active or missing.")
+      press()
+    end
+  end
+end
+
+local function massDeleteJobsByStatus(status)
+  header("Mass Delete " .. status .. " Jobs")
+  print("This deletes whole job records with status " .. status .. ".")
+  print("Tasks are not individually editable or touched outside their parent job.")
+  print("Type DELETE to confirm.")
+  if read() ~= "DELETE" then return end
+  local count = 0
+  for id, job in pairs(copy(state.jobs)) do
+    if job.status == status and deleteJob(id) then count = count + 1 end
+  end
+  cleanupJobLists()
+  saveState()
+  log("Mass deleted " .. tostring(count) .. " " .. status .. " jobs")
+  print("Deleted " .. tostring(count) .. " jobs.")
+  press()
+end
+
 local function jobsMenu()
   while true do
-    local it = choose("Jobs", {{label="View Jobs"},{label="Create New Job"},{label="Pause Job"},{label="Resume Job"},{label="Cancel Job"},{label="Reset Problem Quadrant"},{label="View Job Status"},{label="Back"}})
+    cleanupJobLists()
+    local it = choose("Jobs", {
+      {label="View Jobs"},
+      {label="Create New Job"},
+      {label="Pause Job"},
+      {label="Resume Job"},
+      {label="Cancel Job"},
+      {label="Reset Problem Quadrant"},
+      {label="View Job Status"},
+      {label="Delete Specific Job From History"},
+      {label="Mass Delete CANCELLED Jobs"},
+      {label="Mass Delete COMPLETED Jobs"},
+      {label="Back"}
+    })
     if not it or it.label == "Back" then return end
     if it.label == "View Jobs" or it.label == "View Job Status" then viewJobs()
     elseif it.label == "Create New Job" then createJob()
     elseif it.label == "Pause Job" then pauseResumeCancel("Pause")
     elseif it.label == "Resume Job" then pauseResumeCancel("Resume")
     elseif it.label == "Cancel Job" then pauseResumeCancel("Cancel")
-    elseif it.label == "Reset Problem Quadrant" then resetProblemTask() end
+    elseif it.label == "Reset Problem Quadrant" then resetProblemTask()
+    elseif it.label == "Delete Specific Job From History" then deleteSpecificHistoryJob()
+    elseif it.label == "Mass Delete CANCELLED Jobs" then massDeleteJobsByStatus("CANCELLED")
+    elseif it.label == "Mass Delete COMPLETED Jobs" then massDeleteJobsByStatus("COMPLETED") end
   end
 end
 
@@ -825,7 +1025,7 @@ local function gpsMenu()
       header("GPS Diagnostics")
       term.write("Controller: "); writeCoord(state.gps.x and state.gps or nil); print("")
       local c, ids = activeGpsSubhosts(); print("GPS Subhosts online: " .. c .. "/3")
-      for _, id in ipairs(ids) do local a=state.agents[id]; print("  "..id.." "..(a.pos and (a.pos.x..","..a.pos.y..","..a.pos.z) or "unknown")) end
+      for _, id in ipairs(ids) do local a=state.agents[id]; term.write("  "..id.." "); writeCoord(a and a.pos or nil); print("") end
       press()
     elseif it.label == "Reset GPS Subhosts" then print("Type RESET to command all GPS subhosts to clear coordinates."); if read()=="RESET" then broadcast({type="GPS_RESET",payload={}}); log("GPS reset broadcast") end end
   end
@@ -845,6 +1045,32 @@ local function fleetMenu()
   end
 end
 
+local function settingsMenu()
+  while true do
+    local it = choose("Settings", {
+      {label="GPS check move interval: " .. tostring(state.settings.gpsCheckMoves)},
+      {label="Torch spacing: " .. tostring(state.settings.torchSpacing)},
+      {label="Back"}
+    })
+    if not it or it.label == "Back" then return end
+    if it.label:find("GPS check") then
+      header("GPS Check Move Interval")
+      print("Miner movement GPS verification interval.")
+      local n = math.max(1, math.floor(promptNumber("Moves between GPS checks", state.settings.gpsCheckMoves)))
+      state.settings.gpsCheckMoves = n
+      saveState()
+      log("Set gpsCheckMoves to " .. tostring(n))
+    elseif it.label:find("Torch spacing") then
+      header("Torch Spacing")
+      print("Torch grid spacing for jobs using Replaced torch mode.")
+      local n = math.max(2, math.floor(promptNumber("Torch spacing", state.settings.torchSpacing)))
+      state.settings.torchSpacing = n
+      saveState()
+      log("Set torchSpacing to " .. tostring(n))
+    end
+  end
+end
+
 local function logsMenu()
   header("Logs")
   local start = math.max(1, #state.logs - 30)
@@ -860,7 +1086,7 @@ local function mainMenu()
     elseif it.label == "Fleet" then fleetMenu()
     elseif it.label == "GPS" then gpsMenu()
     elseif it.label == "Protected Blocks" then protectedMenu()
-    elseif it.label == "Settings" then header("Settings"); print("GPS move interval: "..state.settings.gpsCheckMoves); print("Torch spacing: "..state.settings.torchSpacing); press()
+    elseif it.label == "Settings" then settingsMenu()
     elseif it.label == "Logs" then logsMenu() end
   end
 end
@@ -868,6 +1094,7 @@ end
 math.randomseed(os.epoch("utc") + os.getComputerID())
 ensureDir()
 healState(loadTable(STATE_FILE))
+cleanupJobLists()
 saveState()
 attachMonitor()
 if not openModem() then header("Error"); print("No modem found."); return end
