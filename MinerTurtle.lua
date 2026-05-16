@@ -65,6 +65,8 @@ local function validPacket(p) return type(p)=="table" and p.project==PROJECT and
 local function heartbeat() local pl={role=ROLE,status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.homeValid,inventoryValid=state.inventoryValid,gpsValid=state.gpsValid,atHome=state.atHome,protectedRevision=state.protectedRevision,rogue=state.rogue,originLockHeld=state.originLockHeld,lastProblem=state.lastProblem}; if state.controllerId then send(state.controllerId,{type="HEARTBEAT",payload=pl}) else broadcast({type="HEARTBEAT",payload=pl}) end end
 local function register() broadcast({type="REGISTER",payload={role=ROLE,label=os.getComputerLabel(),status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.homeValid,inventoryValid=state.inventoryValid,gpsValid=state.gpsValid,atHome=state.atHome,protectedRevision=state.protectedRevision,rogue=state.rogue}}) end
 local function report(typeName, payload) if state.controllerId then send(state.controllerId,{type=typeName,payload=payload or {}}) else broadcast({type=typeName,payload=payload or {}}) end end
+local function requestReturnHome(reason) returnRequested=true; returnReason=reason or "Return requested"; state.status="RETURN_REQUESTED"; saveState(); heartbeat() end
+local function shouldInterruptMovement() return returnRequested or state.rogue end
 
 -- ---------- GPS quorum ----------
 local function locate(timeout) local x,y,z = gps.locate(timeout or 2); if x then return {x=math.floor(x+0.5),y=math.floor(y+0.5),z=math.floor(z+0.5)} end return nil end
@@ -121,7 +123,36 @@ local function allowedTarget(p, reason)
 end
 
 -- ---------- problem / rogue ----------
-local function reportProblem(reason, extra) state.status="PROBLEM"; state.lastProblem=reason; state.lastProblemPos=copy(state.pos); saveState(); report("TASK_PROBLEM",{reason=reason,pos=copy(state.pos),taskId=state.task and state.task.id,extra=extra}); return false end
+local function clearLocalTaskAfterProblem()
+  state.assignment=nil
+  state.task=nil
+  state.job=nil
+  state.originLockHeld=false
+  state.routePhase="idle"
+  paused=false
+end
+local function reportProblem(reason, extra)
+  local taskId = state.task and state.task.id
+  state.status="PROBLEM"
+  state.lastProblem=reason
+  state.lastProblemPos=copy(state.pos)
+  saveState()
+  report("TASK_PROBLEM",{reason=reason,pos=copy(state.pos),taskId=taskId,extra=extra})
+  if taskId then clearLocalTaskAfterProblem(); saveState(); heartbeat() end
+  return false
+end
+local function problemKey(name)
+  local t = state.task and state.task.id or "no_task"
+  local p = state.pos or {x=0,y=0,z=0}
+  return table.concat({t,tostring(name),tostring(p.x),tostring(p.y),tostring(p.z)},"|")
+end
+local function bumpProblemRetry(name)
+  state.problemRetries = state.problemRetries or {}
+  local k=problemKey(name)
+  state.problemRetries[k]=(state.problemRetries[k] or 0)+1
+  saveState()
+  return state.problemRetries[k],k
+end
 local function markRogue(reason) state.rogue=true; state.status="ROGUE"; state.lastProblem=reason; state.lastProblemPos=copy(state.pos); saveState(); pcall(os.setComputerLabel,"ROGUE-Miner-"..os.getComputerID()); report("ROGUE",{reason=reason,pos=copy(state.pos),home=copy(state.home),taskId=state.task and state.task.id}); error("ROGUE: "..tostring(reason),0) end
 
 -- ---------- inventory / service ----------
@@ -154,6 +185,7 @@ local function inspectForDir(dir) if dir=="up" then return blockName("up") elsei
 local function turtleMove(dir) if dir=="up" then return turtle.up() elseif dir=="down" then return turtle.down() else return turtle.forward() end end
 local function turtleBack() return turtle.back() end
 local function rawMove(dir, reason, allowDig, allowBypass)
+  if shouldInterruptMovement() then return false end
   if not gpsCheck(false) then return false end
   local target=targetForDir(dir); local ok,why=allowedTarget(target,reason); if not ok then return reportProblem(why,{target=target,reason=reason}) end
   local n=inspectForDir(dir)
@@ -184,11 +216,14 @@ function handleLava(dir,target)
   return true
 end
 
+local returnToOrigin
+
 -- ---------- bypass and rollback ----------
 local function appendInverse(rollback, action)
   if action=="L" then table.insert(rollback,"R") elseif action=="R" then table.insert(rollback,"L") elseif action=="F" then table.insert(rollback,"B") elseif action=="U" then table.insert(rollback,"D") elseif action=="D" then table.insert(rollback,"U") end
 end
 local function runAction(action, rollback, reason)
+  if shouldInterruptMovement() then return false end
   if action=="L" then turnLeft(); appendInverse(rollback,"L"); return true end
   if action=="R" then turnRight(); appendInverse(rollback,"R"); return true end
   if action=="F" then if rawMove("forward",reason,true,false) then appendInverse(rollback,"F"); return true end; return false end
@@ -208,23 +243,86 @@ local function tryBypassPath(actions, label)
   state.stats.bypasses=(state.stats.bypasses or 0)+1; state.status="WORKING"; saveState(); return true
 end
 function attemptBypassProtected(name, reason)
+  if shouldInterruptMovement() then return false end
   report("BYPASS_ATTEMPT",{name=name,pos=copy(state.pos),taskId=state.task and state.task.id})
   local h=state.job and state.job.layerHeight or 1
-  -- height 2: try under first, then side. This moves under and past object, never ending under/on it.
-  if h==2 and tryBypassPath({"D","F","F","U"},"UNDER") then return true end
-  -- height >=3: vertical bypass can go over and past, then descend only after clearing object.
-  if h>=3 and tryBypassPath({"U","F","F","D"},"OVER") then return true end
-  -- side bypasses: around the obstacle with exact left/right mirrored paths.
-  if tryBypassPath({"L","F","R","F","F","R","F","L"},"LEFT") then return true end
-  if tryBypassPath({"R","F","L","F","F","L","F","R"},"RIGHT") then return true end
-  return reportProblem("Unable to bypass protected/ignored block within limit: "..tostring(name),{name=name,limit=BYPASS_LIMIT})
+
+  local function repeatAction(action, count)
+    local t={}
+    for i=1,count do table.insert(t,action) end
+    return t
+  end
+  local function join(...)
+    local out={}
+    for _,part in ipairs({...}) do
+      for _,a in ipairs(part) do table.insert(out,a) end
+    end
+    return out
+  end
+
+  -- Height 2: try under-routes with increasing forward clearance.
+  -- The turtle goes down, moves forward far enough to clear the protected block,
+  -- then comes back up only after it is past the obstruction.
+  if h==2 then
+    for forwardDist=2,BYPASS_LIMIT do
+      if shouldInterruptMovement() then return false end
+      if tryBypassPath(join({"D"},repeatAction("F",forwardDist),{"U"}),"UNDER_"..forwardDist) then return true end
+    end
+  end
+
+  -- Height >=3: try over-routes with increasing forward clearance.
+  -- It must move over AND past the protected block before descending.
+  if h>=3 then
+    for forwardDist=2,BYPASS_LIMIT do
+      if shouldInterruptMovement() then return false end
+      if tryBypassPath(join({"U"},repeatAction("F",forwardDist),{"D"}),"OVER_"..forwardDist) then return true end
+    end
+  end
+
+  -- Side bypasses expand outward and forward from the problem point.
+  -- Pattern: sidestep N, move forward M, return to the original line, then continue.
+  -- This fixes the monitor/chest case where a 1-wide sidestep or 2-forward jog is not enough.
+  for sideDist=1,BYPASS_LIMIT do
+    for forwardDist=2,BYPASS_LIMIT do
+      if shouldInterruptMovement() then return false end
+      local leftPath = join({"L"},repeatAction("F",sideDist),{"R"},repeatAction("F",forwardDist),{"R"},repeatAction("F",sideDist),{"L"})
+      if tryBypassPath(leftPath,"LEFT_"..sideDist.."_"..forwardDist) then return true end
+      if shouldInterruptMovement() then return false end
+      local rightPath = join({"R"},repeatAction("F",sideDist),{"L"},repeatAction("F",forwardDist),{"L"},repeatAction("F",sideDist),{"R"})
+      if tryBypassPath(rightPath,"RIGHT_"..sideDist.."_"..forwardDist) then return true end
+    end
+  end
+
+  local tries = bumpProblemRetry(name)
+  report("BYPASS_RETRY",{name=name,pos=copy(state.pos),taskId=state.task and state.task.id,attempt=tries,limit=3})
+
+  -- First two failures on the same obstruction return to origin and retry the same path.
+  -- Third failure marks the task/quadrant as Problem so the controller can skip it and assign the next task.
+  if tries < 3 and state.job and state.task then
+    pcall(function() returnToOrigin() end)
+    return false
+  end
+
+  return reportProblem("Unable to bypass protected/ignored block after 3 origin retries: "..tostring(name),{name=name,limit=BYPASS_LIMIT,attempts=tries})
 end
 local function moveChecked(dir, reason) return rawMove(dir, reason, true, true) end
 
 -- ---------- routing ----------
-function goY(y, reason) while state.pos.y<y do if not moveChecked("up",reason) then return false end end while state.pos.y>y do if not moveChecked("down",reason) then return false end end return true end
-function goX(x, reason) while state.pos.x<x do face("east"); if not moveChecked("forward",reason) then return false end end while state.pos.x>x do face("west"); if not moveChecked("forward",reason) then return false end end return true end
-function goZ(z, reason) while state.pos.z<z do face("south"); if not moveChecked("forward",reason) then return false end end while state.pos.z>z do face("north"); if not moveChecked("forward",reason) then return false end end return true end
+function goY(y, reason)
+  while state.pos.y<y do if shouldInterruptMovement() then return false end; if not moveChecked("up",reason) then return false end end
+  while state.pos.y>y do if shouldInterruptMovement() then return false end; if not moveChecked("down",reason) then return false end end
+  return true
+end
+function goX(x, reason)
+  while state.pos.x<x do if shouldInterruptMovement() then return false end; face("east"); if not moveChecked("forward",reason) then return false end end
+  while state.pos.x>x do if shouldInterruptMovement() then return false end; face("west"); if not moveChecked("forward",reason) then return false end end
+  return true
+end
+function goZ(z, reason)
+  while state.pos.z<z do if shouldInterruptMovement() then return false end; face("south"); if not moveChecked("forward",reason) then return false end end
+  while state.pos.z>z do if shouldInterruptMovement() then return false end; face("north"); if not moveChecked("forward",reason) then return false end end
+  return true
+end
 function goTo(p, reason) if not gpsCheck(true) then return false end if not p then return false end if not goY(p.y,reason) then return false end if not goX(p.x,reason) then return false end if not goZ(p.z,reason) then return false end return gpsCheck(true) end
 
 -- ---------- home setup ----------
@@ -267,11 +365,12 @@ local function mineColumnAt(x,z)
   if not digColumnAroundTravel() then return false end
   placeTorchIfNeeded(x,z); return true
 end
-local function returnToOrigin()
+returnToOrigin = function()
   local o=originPos(); if not o then return false end
   state.routePhase="to_origin"; state.status="MOVING_TO_ORIGIN"; saveState(); local ok=goTo(o,"origin"); state.routePhase="idle"; if ok then report("AT_ORIGIN",{pos=copy(state.pos),taskId=state.task and state.task.id}) end return ok
 end
 local function workTask()
+  if returnRequested then return false end
   if not state.job or not state.task then return false end
   if (state.protectedRevision or 0) < (state.assignment and state.assignment.protectedRevision or 0) then report("PROTECTED_REQUEST",{}); sleep(1) end
   state.status="CLAIMING_ORIGIN"; heartbeat(); local ok,why=claimOriginLock(); if not ok then return reportProblem("Could not claim origin movement lock: "..tostring(why)) end
@@ -279,13 +378,14 @@ local function workTask()
   releaseOriginLock()
   state.status="WORKING"; state.routePhase="work"; saveState(); heartbeat()
   local b=state.task.bounds
-  for z=b.minZ,b.maxZ do local xStart,xEnd,xStep=b.minX,b.maxX,1; if (z-b.minZ)%2==1 then xStart,xEnd,xStep=b.maxX,b.minX,-1 end; local x=xStart; while (xStep==1 and x<=xEnd) or (xStep==-1 and x>=xEnd) do fuelIfNeeded(); local svc,whySvc=needsService(); if svc then local resume={x=x,y=state.task.travelY,z=z}; if not returnToOrigin() then return false end; if not serviceInventory() then return reportProblem("Supplies unavailable: "..tostring(whySvc)) end; if not returnToOrigin() then return false end; state.routePhase="work"; if not goTo(resume,"work") then return false end else if not mineColumnAt(x,z) then return false end; x=x+xStep end end end
+  for z=b.minZ,b.maxZ do if shouldInterruptMovement() then return false end; local xStart,xEnd,xStep=b.minX,b.maxX,1; if (z-b.minZ)%2==1 then xStart,xEnd,xStep=b.maxX,b.minX,-1 end; local x=xStart; while (xStep==1 and x<=xEnd) or (xStep==-1 and x>=xEnd) do if shouldInterruptMovement() then return false end; fuelIfNeeded(); local svc,whySvc=needsService(); if svc then local resume={x=x,y=state.task.travelY,z=z}; if not returnToOrigin() then return false end; if not serviceInventory() then return reportProblem("Supplies unavailable: "..tostring(whySvc)) end; if not returnToOrigin() then return false end; state.routePhase="work"; if not goTo(resume,"work") then return false end else if not mineColumnAt(x,z) then return false end; x=x+xStep end end end
   state.routePhase="to_origin"; returnToOrigin(); state.routePhase="to_home"; serviceInventory(); state.routePhase="idle"
   local taskId=state.task.id; state.status="IDLE"; state.assignment=nil; state.task=nil; state.job=nil; paused=false; saveState(); report("TASK_COMPLETE",{taskId=taskId,pos=copy(state.pos)}); return true
 end
 
 -- ---------- emergency / command handling ----------
 local function emergencyReturn(reason)
+  returnRequested=false; returnReason=nil
   state.killMode=true; state.status="EMERGENCY_RETURN"; saveState(); heartbeat(); paused=false
   if state.job and state.task then pcall(returnToOrigin) end
   state.routePhase="to_home"
@@ -301,8 +401,9 @@ function handlePacket(id,msg)
   elseif msg.type=="ROLL_CALL" then heartbeat()
   elseif msg.type=="PAUSE_JOB" then paused=true; state.status="PAUSED"; saveState(); heartbeat()
   elseif msg.type=="RESUME_JOB" then paused=false; state.status="IDLE"; saveState(); heartbeat()
-  elseif msg.type=="GO_HOME" then emergencyReturn("Controller ordered home")
-  elseif msg.type=="EMERGENCY_STOP_RETURN" then emergencyReturn("Controller kill switch")
+  elseif msg.type=="GO_HOME" then requestReturnHome("Controller ordered home")
+  elseif msg.type=="CANCEL_JOB" then if (not state.job) or (msg.payload and msg.payload.jobId==state.job.id) then requestReturnHome("Job cancelled") end
+  elseif msg.type=="EMERGENCY_STOP_RETURN" then requestReturnHome("Controller kill switch")
   elseif msg.type=="KILL_SWITCH_CLEAR" then if state.rogue and isAtHome() then state.rogue=false; state.status="AT_HOME"; pcall(os.setComputerLabel,"Miner-"..os.getComputerID()); saveState() end
   elseif msg.type=="TASK_ASSIGN" then if state.rogue then report("ROGUE",{reason="Rogue turtle refused task",pos=copy(state.pos)}); return end; state.controllerId=id; state.assignment=copy(msg.payload); state.job=copy(msg.payload.job); state.task=copy(msg.payload.task); state.assignment.protectedRevision=msg.payload.protectedRevision or 0; state.status="ASSIGNED"; saveState(); heartbeat()
   end
@@ -311,7 +412,7 @@ end
 -- ---------- loops ----------
 local function networkLoop() while running do local id,msg=rednet.receive(PROTOCOL,1); if id then handlePacket(id,msg) end end end
 local function heartbeatLoop() while running do heartbeat(); sleep(HEARTBEAT_INTERVAL) end end
-local function workLoop() while running do if state.rogue then sleep(2) elseif state.job and state.task and not paused then workTask() else sleep(1) end end end
+local function workLoop() while running do if state.rogue then sleep(2) elseif returnRequested then emergencyReturn(returnReason or "Return requested") elseif state.job and state.task and not paused then workTask() else sleep(1) end end end
 local function displayLoop() while running do header("Status"); print("ID: "..os.getComputerID()); print("Status: "..tostring(state.status)); term.write("Pos: "); writeCoord(state.pos); print(""); term.write("Home: "); writeCoord(state.home); print(""); print("Facing: "..tostring(state.facing)); print("GPS: "..tostring(state.gpsValid).."  Home valid: "..tostring(state.homeValid)); print("Inventory valid: "..tostring(state.inventoryValid)); print("Protected rev: "..tostring(state.protectedRevision)); print("Task: "..tostring(state.task and state.task.id or "none")); if state.rogue then color(colors.red); print("ROGUE LOCK: place turtle at saved home and reboot."); color(colors.lightGray) end if state.lastProblem then color(colors.red); print("Problem: "..tostring(state.lastProblem)); color(colors.lightGray) end sleep(2) end end
 
 -- ---------- boot ----------
