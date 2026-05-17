@@ -236,6 +236,60 @@ function handleLava(dir,target)
   return true
 end
 
+
+-- Route movement is intentionally non-fatal.  A normal moveChecked()/rawMove()
+-- reports TASK_PROBLEM when turtle.forward() returns false.  That is correct
+-- while mining, but wrong while planning home->origin travel: another turtle,
+-- a player, or a just-updated block can make forward fail even when the route
+-- should simply be retried or replanned.  This function either completes one
+-- forward step, or returns a reason/target for the route planner to mark blocked.
+local function routeForwardStep(reason)
+  if shouldInterruptMovement() then return false,"interrupted",targetForDir("forward") end
+  if not gpsCheck(false) then return false,"gps",targetForDir("forward") end
+
+  local target = targetForDir("forward")
+  local ok, why = allowedTarget(target, reason)
+  if not ok then return false, why or "not_allowed", target end
+
+  for attempt=1,6 do
+    local n = blockName("forward")
+
+    if n then
+      if isProtectedName(n) or (isTorchName(n) and state.job and state.job.torchMode=="ignored") then
+        return false,"blocked_protected",target,n
+      end
+      if isTorchName(n) and state.job and state.job.torchMode=="replaced" and state.task and state.task.passIndex>1 then
+        return false,"blocked_preserved_torch",target,n
+      end
+      if n=="minecraft:lava" or n=="minecraft:flowing_lava" then
+        if not handleLava("forward", target) then return false,"lava",target,n end
+      else
+        -- Corridor routing may dig ordinary blocks, but never protected blocks.
+        if not turtle.dig() then
+          return false,"dig_failed",target,n
+        end
+        state.stats.mined=(state.stats.mined or 0)+1
+      end
+    end
+
+    if turtle.forward() then
+      state.pos=target
+      state.lastSafePos=copy(target)
+      state.movesSinceGps=(state.movesSinceGps or 0)+1
+      saveState()
+      if not gpsCheck(false) then return false,"gps_after_move",target end
+      return true,nil,target
+    end
+
+    -- If inspect still sees nothing, this is usually a transient collision
+    -- such as another turtle/player/entity.  Wait briefly before deciding the
+    -- coordinate should be treated as occupied and replanned around.
+    sleep(0.25)
+  end
+
+  return false,"move_failed_transient",target
+end
+
 local returnToOrigin
 
 -- ---------- bypass and rollback ----------
@@ -501,11 +555,11 @@ local function routeAllowed(target, reason)
         break
       end
 
-      if not moveChecked("forward", reason) then
-        -- If movement failed without an inspectable protected block, give the
-        -- planner one chance to treat the target as occupied and route around it.
-        -- This covers transient turtle/entity collision cases.
-        blocked[keyXZ(stepTarget.x, stepTarget.z)] = true
+      local moved, moveWhy, moveTarget, moveBlock = routeForwardStep(reason)
+      if not moved then
+        local blockedTarget = moveTarget or stepTarget
+        blocked[keyXZ(blockedTarget.x, blockedTarget.z)] = true
+        report("ROUTE_REPLAN",{reason=moveWhy,block=moveBlock,pos=copy(state.pos),target=copy(blockedTarget),routeReason=reason,taskId=state.task and state.task.id})
         replans = replans + 1
         hitBlocked = true
         break
