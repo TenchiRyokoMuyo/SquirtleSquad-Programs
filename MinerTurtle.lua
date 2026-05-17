@@ -353,10 +353,59 @@ local function placeTorchIfNeeded(x,z)
 end
 
 -- ---------- mining ----------
+local function shouldPreserveColumnBlock(n)
+  if not n then return false end
+  if isProtectedName(n) then return true end
+  if isTorchName(n) and state.job then
+    if state.job.torchMode == "ignored" then return true end
+    if state.job.torchMode == "replaced" and state.task and state.task.passIndex > 1 then return true end
+  end
+  return false
+end
+
+local function skipProtectedColumnBlock(dir, name)
+  state.stats.protectedSkips = (state.stats.protectedSkips or 0) + 1
+  state.lastProblem = "Skipped protected block " .. tostring(name) .. " " .. tostring(dir)
+  saveState()
+  report("PROTECTED_SKIPPED", {
+    direction = dir,
+    name = name,
+    pos = copy(state.pos),
+    taskId = state.task and state.task.id,
+    jobId = state.job and state.job.id
+  })
+  return true
+end
+
+local function digVerticalIfAllowed(dir)
+  local n = blockName(dir)
+  if not n then return true end
+
+  -- Protected blocks inside a column are not job-ending.
+  -- The miner is allowed to leave that single block in place, then continue the route.
+  -- This is what should happen for chests/monitors/computers hanging above the pass.
+  if shouldPreserveColumnBlock(n) then
+    return skipProtectedColumnBlock(dir, n)
+  end
+
+  if dir == "up" then
+    if not rawMove("up", "work", true, false) then return false end
+    return rawMove("down", "work", true, false)
+  elseif dir == "down" then
+    if not rawMove("down", "work", true, false) then return false end
+    return rawMove("up", "work", true, false)
+  end
+  return true
+end
+
 local function digColumnAroundTravel()
-  local b=state.task.bounds
-  if b.maxY>state.pos.y then local n=blockName("up"); if n and (isProtectedName(n) or (isTorchName(n) and state.job.torchMode=="ignored")) then return reportProblem("Column blocked above by protected/ignored block: "..n,{pos=copy(state.pos)}) end; if n then rawMove("up","work",true,true); rawMove("down","work",true,true) end end
-  if b.minY<state.pos.y then local n=blockName("down"); if n and (isProtectedName(n) or (isTorchName(n) and state.job.torchMode=="ignored")) then return reportProblem("Column blocked below by protected/ignored block: "..n,{pos=copy(state.pos)}) end; if n then rawMove("down","work",true,true); rawMove("up","work",true,true) end end
+  local b = state.task.bounds
+  if b.maxY > state.pos.y then
+    if not digVerticalIfAllowed("up") then return false end
+  end
+  if b.minY < state.pos.y then
+    if not digVerticalIfAllowed("down") then return false end
+  end
   return true
 end
 local function mineColumnAt(x,z)
