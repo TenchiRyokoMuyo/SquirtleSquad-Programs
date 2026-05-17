@@ -542,6 +542,28 @@ function goTo(p, reason)
   if not gpsCheck(true) then return false end
   if not p then return false end
 
+  -- IMPORTANT: when leaving the home rack for origin, do NOT change Y first.
+  -- The miner is normally sitting above its deposit chest. If task travelY is
+  -- one block lower than home, a Y-first route tries to move down into that
+  -- protected chest and immediately fails as "Could not reach origin".
+  -- Instead, travel horizontally through the permitted home->origin corridor
+  -- at the miner's current/home Y, then descend/ascend only once aligned with
+  -- the job origin X/Z.
+  if state.job and state.pos and reason == "origin" and state.pos.y ~= p.y then
+    local via = {x = p.x, y = state.pos.y, z = p.z}
+    if not routeAllowed(via, "origin") then return false end
+    if state.pos.y ~= p.y then
+      if not goY(p.y, "origin") then return false end
+    end
+    return gpsCheck(true)
+  end
+
+  -- Returning home is the opposite: get back to the saved home Y first while
+  -- still away from the rack, then use the permitted corridor to reach home.
+  if state.job and state.pos and reason == "home" and state.pos.y ~= p.y then
+    if not goY(p.y, "home") then return false end
+  end
+
   if state.pos.y ~= p.y then
     if not goY(p.y,reason) then return false end
   end
