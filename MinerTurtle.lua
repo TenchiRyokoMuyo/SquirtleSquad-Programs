@@ -6,7 +6,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "miner"
-local VERSION = "v2.1-fullpass"
+local VERSION = "v2.1-fullpass-refuel-origin-horizontal"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MinerTurtle"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -425,6 +425,19 @@ end
 function goTo(p, reason)
   if not gpsCheck(true) then return false end
   if not p then return false end
+
+  -- Home -> origin special case:
+  -- A miner sits on layer 2 with the deposit chest directly below it.
+  -- When later passes use a lower travelY, changing Y first makes the turtle
+  -- try to move down into its own protected deposit chest.
+  -- While physically at home and heading to origin, leave the rack horizontally
+  -- at the current home Y first, then change Y only after reaching origin X/Z.
+  if reason == "origin" and state.home and samePos(state.pos, state.home) and p.y ~= state.pos.y then
+    if not goX(p.x, reason) then return false end
+    if not goZ(p.z, reason) then return false end
+    if not goY(p.y, reason) then return false end
+    return gpsCheck(true)
+  end
 
   -- Work/origin travel inside shaped jobs must not use blind X-then-Z routing.
   -- For circles, domes, cones, stretched cylinders, etc., a straight axis route can
