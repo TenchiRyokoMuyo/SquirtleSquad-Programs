@@ -53,6 +53,7 @@ local function defaultState()
     settings = { gpsCheckMoves = 8, torchSpacing = 8 },
     killSwitch = { active = false, id = nil, startedAt = nil },
     originLocks = {},
+    transitLock = { holder = nil, queue = {} },
   }
   return s
 end
@@ -124,6 +125,8 @@ local function healState(s)
   if s.settings.torchSpacing == nil then s.settings.torchSpacing = d.settings.torchSpacing end
   s.killSwitch = s.killSwitch or d.killSwitch
   s.originLocks = s.originLocks or {}
+  s.transitLock = s.transitLock or { holder = nil, queue = {} }
+  s.transitLock.queue = s.transitLock.queue or {}
   state = s
   normalizeProtected()
 end
@@ -640,6 +643,7 @@ local function handleHeartbeat(id, p)
 end
 
 local releaseMinerOriginLocks
+local releaseMinerTransitLocks
 
 local function markTaskByMiner(minerId, status, problem)
   for _, job in pairs(state.jobs) do
@@ -650,6 +654,7 @@ local function markTaskByMiner(minerId, status, problem)
         if status == "PROBLEM" then t.problem = problem or "Unknown problem" end
         if state.agents[minerId] then state.agents[minerId].status = status == "COMPLETED" and "IDLE" or "PROBLEM"; state.agents[minerId].assignedTask = nil end
         releaseMinerOriginLocks(minerId)
+        if releaseMinerTransitLocks then releaseMinerTransitLocks(minerId) end
         checkJobCompletion(job)
         saveState()
         return true
@@ -697,6 +702,116 @@ local function handleOriginLockRelease(id, p)
   end
 end
 
+
+-- Global transit queue for home <-> origin traffic.
+-- This prevents turtles from crowding the rack/origin corridor.
+local function cleanTransitQueue()
+  state.transitLock = state.transitLock or { holder = nil, queue = {} }
+  state.transitLock.queue = state.transitLock.queue or {}
+  local q = {}
+  for _, e in ipairs(state.transitLock.queue) do
+    if e and e.minerId and state.agents[e.minerId] and agentIsOnline(state.agents[e.minerId]) then
+      table.insert(q, e)
+    end
+  end
+  state.transitLock.queue = q
+end
+
+local function transitQueueIndex(minerId, lockId)
+  cleanTransitQueue()
+  for i, e in ipairs(state.transitLock.queue) do
+    if e.minerId == minerId and (not lockId or e.lockId == lockId) then return i end
+  end
+  return nil
+end
+
+local function grantTransitLock(e)
+  state.transitLock = state.transitLock or { holder = nil, queue = {} }
+  state.transitLock.holder = {
+    minerId = e.minerId,
+    lockId = e.lockId,
+    purpose = e.purpose,
+    jobId = e.jobId,
+    taskId = e.taskId,
+    startedAt = now(),
+    pos = e.pos,
+  }
+  if state.agents[e.minerId] then
+    state.agents[e.minerId].status = e.purpose == "to_home" and "RETURNING" or "MOVING_TO_ORIGIN"
+  end
+  send(e.minerId, { type="TRANSIT_LOCK_GRANTED", payload={ lockId=e.lockId, purpose=e.purpose, jobId=e.jobId, taskId=e.taskId } })
+  log("Transit lock granted to " .. tostring(e.minerId) .. " (" .. tostring(e.purpose) .. ")")
+end
+
+local function promoteTransitLock()
+  state.transitLock = state.transitLock or { holder = nil, queue = {} }
+  if state.transitLock.holder then return end
+  cleanTransitQueue()
+  while #state.transitLock.queue > 0 do
+    local e = table.remove(state.transitLock.queue, 1)
+    if e and e.minerId and state.agents[e.minerId] and agentIsOnline(state.agents[e.minerId]) then
+      grantTransitLock(e)
+      saveState()
+      return
+    end
+  end
+  saveState()
+end
+
+releaseMinerTransitLocks = function(minerId)
+  state.transitLock = state.transitLock or { holder = nil, queue = {} }
+  if state.transitLock.holder and state.transitLock.holder.minerId == minerId then
+    state.transitLock.holder = nil
+  end
+  cleanTransitQueue()
+  for i = #state.transitLock.queue, 1, -1 do
+    if state.transitLock.queue[i].minerId == minerId then table.remove(state.transitLock.queue, i) end
+  end
+  promoteTransitLock()
+end
+
+local function handleTransitLockRequest(id, p)
+  state.transitLock = state.transitLock or { holder = nil, queue = {} }
+  local pl = p.payload or {}
+  local holder = state.transitLock.holder
+  if holder and ((now() - (holder.startedAt or 0)) > 180000 or not state.agents[holder.minerId] or not agentIsOnline(state.agents[holder.minerId])) then
+    log("Transit lock expired from " .. tostring(holder.minerId))
+    state.transitLock.holder = nil
+    holder = nil
+  end
+  local entry = { minerId=id, lockId=pl.lockId or (tostring(id)..":"..tostring(now())), purpose=pl.purpose or "transit", jobId=pl.jobId, taskId=pl.taskId, requestedAt=now(), pos=pl.pos }
+  if holder and holder.minerId == id then
+    send(id, { type="TRANSIT_LOCK_GRANTED", payload={ lockId=holder.lockId, purpose=holder.purpose, jobId=holder.jobId, taskId=holder.taskId } })
+    return
+  end
+  if not state.transitLock.holder then
+    grantTransitLock(entry)
+  else
+    local idx = transitQueueIndex(id, entry.lockId)
+    if not idx then
+      table.insert(state.transitLock.queue, entry)
+      idx = #state.transitLock.queue
+      log("Transit queued " .. tostring(id) .. " (" .. tostring(entry.purpose) .. ") pos " .. tostring(idx))
+    end
+    send(id, { type="TRANSIT_LOCK_WAIT", payload={ lockId=entry.lockId, purpose=entry.purpose, position=idx, holder=state.transitLock.holder and state.transitLock.holder.minerId } })
+  end
+  saveState()
+end
+
+local function handleTransitLockRelease(id, p)
+  state.transitLock = state.transitLock or { holder = nil, queue = {} }
+  local pl = p.payload or {}
+  local holder = state.transitLock.holder
+  if holder and holder.minerId == id and (not pl.lockId or holder.lockId == pl.lockId) then
+    log("Transit lock released by " .. tostring(id) .. " (" .. tostring(holder.purpose) .. ")")
+    state.transitLock.holder = nil
+    promoteTransitLock()
+  else
+    local idx = transitQueueIndex(id, pl.lockId)
+    if idx then table.remove(state.transitLock.queue, idx); saveState() end
+  end
+end
+
 local function handlePacket(id, p)
   if not validPacket(p) then return end
   if p.type == "REGISTER" then handleRegister(id, p)
@@ -705,6 +820,8 @@ local function handlePacket(id, p)
   elseif p.type == "PROTECTED_REQUEST" then sendProtected(id)
   elseif p.type == "ORIGIN_LOCK_REQUEST" then handleOriginLockRequest(id, p)
   elseif p.type == "ORIGIN_LOCK_RELEASE" then handleOriginLockRelease(id, p)
+  elseif p.type == "TRANSIT_LOCK_REQUEST" then handleTransitLockRequest(id, p)
+  elseif p.type == "TRANSIT_LOCK_RELEASE" then handleTransitLockRelease(id, p)
   elseif p.type == "TASK_COMPLETE" then markTaskByMiner(id, "COMPLETED")
   elseif p.type == "TASK_PROBLEM" then markTaskByMiner(id, "PROBLEM", p.payload and p.payload.reason)
   elseif p.type == "ROGUE" then
@@ -715,6 +832,7 @@ local function handlePacket(id, p)
     saveState()
   elseif p.type == "AT_HOME" then
     if state.agents[id] then state.agents[id].atHome = true; state.agents[id].status = "AT_HOME" end
+    releaseMinerTransitLocks(id)
   elseif p.type == "AT_ORIGIN" then
     if state.agents[id] then
       state.agents[id].status = "AT_ORIGIN"
@@ -879,6 +997,7 @@ local function killSwitch()
   state.killSwitch = { active=true, id=makeId("kill"), startedAt=now() }
   saveState()
   state.originLocks = {}
+  state.transitLock = { holder = nil, queue = {} }
   broadcast({ type="EMERGENCY_STOP_RETURN", payload={ killId=state.killSwitch.id, reason="controller_kill_switch" } })
   log("KILL SWITCH ACTIVATED " .. state.killSwitch.id)
   print("Kill switch broadcast.")
