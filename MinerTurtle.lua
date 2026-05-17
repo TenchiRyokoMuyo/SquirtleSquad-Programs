@@ -404,7 +404,7 @@ local function routeInsideJob(target, reason)
   return gpsCheck(false)
 end
 
-local function planPathAllowed(target, reason)
+local function planPathAllowed(target, reason, blocked)
   if not target or not state.pos then return nil,"no target/current position" end
   if state.pos.y ~= target.y then return nil,"path planner requires same Y" end
   local start={x=state.pos.x,y=state.pos.y,z=state.pos.z}
@@ -446,7 +446,7 @@ local function planPathAllowed(target, reason)
         local ok=allowedTarget(np,reason)
         if ok then
           local nk=k(nx,nz)
-          if came[nk]==nil then
+          if (not blocked or not blocked[nk]) and came[nk]==nil then
             came[nk]=k(cur.x,cur.z)
             cameDir[nk]=d.name
             if nk==goalKey then
@@ -468,16 +468,58 @@ local function planPathAllowed(target, reason)
 end
 
 local function routeAllowed(target, reason)
-  local path,why=planPathAllowed(target,reason)
-  if not path then return reportProblem("No valid permitted route: "..tostring(why),{target=target,reason=reason}) end
-  state.status=(reason=="origin") and "MOVING_TO_ORIGIN" or "PATHING"
-  saveState(); heartbeat()
-  for _,f in ipairs(path) do
-    if shouldInterruptMovement() then return false end
-    face(f)
-    if not moveChecked("forward", reason) then return false end
+  local blocked = {}
+  local replans = 0
+  local maxReplans = 64
+
+  while replans <= maxReplans do
+    local path,why=planPathAllowed(target,reason,blocked)
+    if not path then
+      return reportProblem("No valid permitted route: "..tostring(why),{target=target,reason=reason})
+    end
+
+    state.status=(reason=="origin") and "MOVING_TO_ORIGIN" or "PATHING"
+    saveState(); heartbeat()
+
+    local hitBlocked = false
+    for _,f in ipairs(path) do
+      if shouldInterruptMovement() then return false end
+      face(f)
+
+      local stepTarget = targetForDir("forward")
+      local n = blockName("forward")
+
+      -- During home/origin corridor pathing, a parked turtle/chest/monitor/etc.
+      -- is not a task-ending problem. Treat that coordinate as blocked, replan,
+      -- and try another legal corridor path. This is what lets the third miner
+      -- route around the home rack instead of marking the quadrant Problem.
+      if n and (isProtectedName(n) or (isTorchName(n) and state.job and state.job.torchMode=="ignored")) then
+        blocked[keyXZ(stepTarget.x, stepTarget.z)] = true
+        report("ROUTE_BLOCKED",{name=n,pos=copy(state.pos),target=copy(stepTarget),reason=reason,taskId=state.task and state.task.id})
+        hitBlocked = true
+        replans = replans + 1
+        break
+      end
+
+      if not moveChecked("forward", reason) then
+        -- If movement failed without an inspectable protected block, give the
+        -- planner one chance to treat the target as occupied and route around it.
+        -- This covers transient turtle/entity collision cases.
+        blocked[keyXZ(stepTarget.x, stepTarget.z)] = true
+        replans = replans + 1
+        hitBlocked = true
+        break
+      end
+    end
+
+    if not hitBlocked then
+      return gpsCheck(false)
+    end
+
+    sleep(0.2)
   end
-  return gpsCheck(false)
+
+  return reportProblem("No valid permitted route after replanning around blocked corridor",{target=target,reason=reason})
 end
 
 -- ---------- routing ----------
@@ -679,6 +721,17 @@ local function boot()
   local ok,why=gpsQuorum(); if not ok then print("GPS invalid: "..tostring(why)); sleep(2); return false end
   if state.rogue then if state.home and samePos(state.pos,state.home) then state.rogue=false; state.status="AT_HOME"; pcall(os.setComputerLabel,"Miner-"..os.getComputerID()); saveState() else header("ROGUE LOCK"); print("This turtle was marked Rogue."); print("Saved home:"); writeCoord(state.home); print(""); print("Current GPS:"); writeCoord(state.pos); print(""); print("Place it back at saved home and reboot."); return false end end
   if not state.homeValid or not state.home then if not setupHome() then return false end else state.atHome=samePos(state.pos,state.home); if not state.atHome then header("Not At Home"); print("Saved home:"); writeCoord(state.home); print(""); print("Current:"); writeCoord(state.pos); print(""); print("Move turtle back home or clear data."); return false end end
+
+  -- A previous build could leave a turtle in PROBLEM with no active task after
+  -- a home-to-origin traffic jam. If it is physically back home, clear that
+  -- transient local problem so the controller can use it again.
+  if state.status == "PROBLEM" and not state.task and state.atHome and not state.rogue then
+    state.status = "AT_HOME"
+    state.lastProblem = nil
+    state.lastProblemPos = nil
+    saveState()
+  end
+
   if not serviceInventory() then header("Inventory"); print("Could not validate fuel/filler/torches from upper chest."); sleep(2) end
   state.status=state.inventoryValid and "AT_HOME" or "NEEDS_SUPPLIES"; saveState(); register(); return true
 end
