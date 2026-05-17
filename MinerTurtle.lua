@@ -120,6 +120,19 @@ local function inHomeCorridor(p)
   local o=originPos()
   return samePos(p,state.home) or corridorBetween(o or state.pos,state.home,p,transitPad())
 end
+
+-- The first step out of the home rack can be slightly different from the
+-- long home->origin corridor. A parked miner may need to step one or two
+-- blocks sideways/backward before the normal route planner can find the
+-- corridor to origin. This is only allowed while leaving home for origin.
+local function inDockEscapeZone(p)
+  if not p or not state.home then return false end
+  if p.y ~= state.home.y then return false end
+  local dx = math.abs((p.x or 0) - (state.home.x or 0))
+  local dz = math.abs((p.z or 0) - (state.home.z or 0))
+  return dx <= 2 and dz <= 2
+end
+
 local function allowedTarget(p, reason)
   if not p then return false,"nil target" end
   if state.rogue then return false,"rogue lock active" end
@@ -128,7 +141,7 @@ local function allowedTarget(p, reason)
     return false,"outside origin-home corridor"
   end
   if reason=="origin" or state.routePhase=="to_origin" then
-    if inOriginCorridor(p) then return true end
+    if inOriginCorridor(p) or inDockEscapeZone(p) then return true end
     return false,"outside origin corridor"
   end
   if reason=="bypass" then
@@ -592,6 +605,60 @@ function goZ(z, reason)
   while state.pos.z>z do if shouldInterruptMovement() then return false end; face("north"); if not moveChecked("forward",reason) then return false end end
   return true
 end
+local function undockFromHomeForOrigin(target)
+  if not state.home or not state.pos or not samePos(state.pos, state.home) then return true end
+  state.status = "UNDOCKING"
+  saveState(); heartbeat()
+
+  local dirs = {"north", "east", "south", "west"}
+  table.sort(dirs, function(a,b)
+    local da, db = DIRS[a], DIRS[b]
+    local pa = {x=state.pos.x+da.dx, y=state.pos.y, z=state.pos.z+da.dz}
+    local pb = {x=state.pos.x+db.dx, y=state.pos.y, z=state.pos.z+db.dz}
+    local oa = target and (math.abs(pa.x-target.x)+math.abs(pa.z-target.z)) or 0
+    local ob = target and (math.abs(pb.x-target.x)+math.abs(pb.z-target.z)) or 0
+    return oa < ob
+  end)
+
+  local tried = {}
+  for _,dir in ipairs(dirs) do
+    if shouldInterruptMovement() then return false end
+    face(dir)
+    local stepTarget = targetForDir("forward")
+    local k = keyXZ(stepTarget.x, stepTarget.z)
+    tried[k] = true
+
+    local okAllowed = allowedTarget(stepTarget, "origin")
+    if okAllowed then
+      local moved, why, blockedTarget, block = routeForwardStep("origin")
+      if moved then
+        report("UNDOCKED", {pos=copy(state.pos), dir=dir, taskId=state.task and state.task.id})
+        return true
+      end
+      report("UNDOCK_BLOCKED", {dir=dir, reason=why, block=block, target=copy(blockedTarget or stepTarget), taskId=state.task and state.task.id})
+    end
+  end
+
+  -- If every preferred direction failed, try all directions once more. This
+  -- catches cases where a transient collision cleared while we were rotating.
+  for _,dir in ipairs(dirs) do
+    if shouldInterruptMovement() then return false end
+    face(dir)
+    local stepTarget = targetForDir("forward")
+    local okAllowed = allowedTarget(stepTarget, "origin")
+    if okAllowed then
+      local moved, why, blockedTarget, block = routeForwardStep("origin")
+      if moved then
+        report("UNDOCKED", {pos=copy(state.pos), dir=dir, retry=true, taskId=state.task and state.task.id})
+        return true
+      end
+      report("UNDOCK_BLOCKED", {dir=dir, reason=why, block=block, target=copy(blockedTarget or stepTarget), retry=true, taskId=state.task and state.task.id})
+    end
+  end
+
+  return reportProblem("Could not undock from home rack", {home=copy(state.home), target=copy(target)})
+end
+
 function goTo(p, reason)
   if not gpsCheck(true) then return false end
   if not p then return false end
@@ -605,6 +672,7 @@ function goTo(p, reason)
   -- the job origin X/Z.
   if state.job and state.pos and reason == "origin" and state.pos.y ~= p.y then
     local via = {x = p.x, y = state.pos.y, z = p.z}
+    if not undockFromHomeForOrigin(via) then return false end
     if not routeAllowed(via, "origin") then return false end
     if state.pos.y ~= p.y then
       if not goY(p.y, "origin") then return false end
@@ -626,6 +694,7 @@ function goTo(p, reason)
   -- This lets miners leave the home rack in sequence and route around parked
   -- turtles/chests while staying inside the approved home<->origin corridor.
   if state.job and state.pos and p.y == state.pos.y and (reason=="origin" or reason=="home") then
+    if reason == "origin" and not undockFromHomeForOrigin(p) then return false end
     local ok = routeAllowed(p, reason)
     if ok and reason == "home" and state.homeFacing then
       face(state.homeFacing)
