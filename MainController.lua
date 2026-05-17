@@ -34,9 +34,9 @@ local monitor = nil
 local modemSide = nil
 local running = true
 local gpsProcessStarted = false
+local gpsHostTab = nil
 local uiBusy = false
 local gpsHostStatus = "stopped"
-local gpsRequestsLabel = "GPS requests handled: hidden"
 
 local function defaultState()
   local s = {
@@ -261,7 +261,14 @@ end
 
 local function press() color(colors.gray); print(""); print("Press any key..."); os.pullEvent("key") end
 local function promptText(label, default)
-  color(colors.lightGray); term.write(label .. (default ~= nil and (" [" .. tostring(default) .. "]") or "") .. ": ")
+  if label == "X" or label == "Y" or label == "Z" then
+    writeAxis(label)
+  else
+    color(colors.lightGray)
+    term.write(label)
+  end
+  if default ~= nil then term.write(" [" .. tostring(default) .. "]") end
+  term.write(": ")
   local s = read()
   if s == "" and default ~= nil then return default end
   return s
@@ -652,21 +659,47 @@ local function networkLoop()
   end
 end
 
+local function gpsTabStillRunning()
+  if not gpsHostTab or not multishell then return false end
+  local ok, title = pcall(multishell.getTitle, gpsHostTab)
+  return ok and title ~= nil
+end
+
+local function launchGpsHostTab()
+  if not (state.gps and state.gps.hostEnabled and state.gps.x and state.gps.y and state.gps.z) then
+    gpsHostStatus = "waiting for coords"
+    return false
+  end
+  if gpsTabStillRunning() then
+    gpsHostStatus = "active tab " .. tostring(gpsHostTab)
+    return true
+  end
+  if not multishell then
+    gpsHostStatus = "no multishell"
+    return false
+  end
+  local gpsProgram = shell.resolveProgram and shell.resolveProgram("gps") or "gps"
+  if not gpsProgram then
+    gpsHostStatus = "gps program missing"
+    return false
+  end
+  local ok, tab = pcall(multishell.launch, {}, gpsProgram, "host", tostring(state.gps.x), tostring(state.gps.y), tostring(state.gps.z))
+  if ok and tab then
+    gpsHostTab = tab
+    pcall(multishell.setTitle, tab, "Squirtle GPS Host")
+    gpsHostStatus = "active tab " .. tostring(tab)
+    log("GPS host launched in tab " .. tostring(tab))
+    return true
+  end
+  gpsHostStatus = "launch failed"
+  log("GPS host launch failed: " .. tostring(tab))
+  return false
+end
+
 local function gpsHostLoop()
   while running do
-    if state.gps and state.gps.hostEnabled and state.gps.x and state.gps.y and state.gps.z then
-      gpsHostStatus = "active"
-      local old = termNative
-      local w, h = old.getSize()
-      local hidden = window.create(old, w, h, 1, 1, false)
-      term.redirect(hidden)
-      shell.run("gps", "host", tostring(state.gps.x), tostring(state.gps.y), tostring(state.gps.z))
-      term.redirect(old)
-      gpsHostStatus = "stopped"
-    else
-      gpsHostStatus = "waiting for coords"
-      sleep(1)
-    end
+    launchGpsHostTab()
+    sleep(5)
   end
 end
 
@@ -713,12 +746,12 @@ end
 local function setControllerGps()
   header("Controller GPS")
   print("Set this computer's fixed GPS host coordinates.")
-  state.gps.x = promptNumber("X", state.gps.x)
-  state.gps.y = promptNumber("Y", state.gps.y)
-  state.gps.z = promptNumber("Z", state.gps.z)
+  state.gps.x = promptAxis("X", state.gps.x)
+  state.gps.y = promptAxis("Y", state.gps.y)
+  state.gps.z = promptAxis("Z", state.gps.z)
   state.gps.hostEnabled = true
   saveState(); log("Controller GPS set")
-  print("Saved. Reboot may be needed if gps host was already running stale coords.")
+  print("Saved. If an old GPS host tab is still using stale coords, reboot this computer.")
   press()
 end
 
