@@ -89,23 +89,6 @@ local function turnRight() turtle.turnRight(); state.facing=ORDER[(faceIndex(sta
 local function turnAround() turnRight(); turnRight() end
 local function face(f) while state.facing~=f do local ci,ti=faceIndex(state.facing),faceIndex(f); if ((ti-ci)%4)==1 then turnRight() elseif ((ci-ti)%4)==1 then turnLeft() else turnRight() end end end
 local function targetForDir(dir) if dir=="up" then return {x=state.pos.x,y=state.pos.y+1,z=state.pos.z} end if dir=="down" then return {x=state.pos.x,y=state.pos.y-1,z=state.pos.z} end local d=DIRS[state.facing]; return {x=state.pos.x+d.dx,y=state.pos.y,z=state.pos.z+d.dz} end
-local function facingFromDelta(a,b)
-  if not a or not b then return nil end
-  local dx=(b.x or 0)-(a.x or 0)
-  local dz=(b.z or 0)-(a.z or 0)
-  if dx==1 and dz==0 then return "east" end
-  if dx==-1 and dz==0 then return "west" end
-  if dx==0 and dz==1 then return "south" end
-  if dx==0 and dz==-1 then return "north" end
-  return nil
-end
-local function oppositeFacing(f)
-  if f=="north" then return "south" end
-  if f=="south" then return "north" end
-  if f=="east" then return "west" end
-  if f=="west" then return "east" end
-  return f
-end
 local function inverseMove(move) if move=="forward" then return "back" elseif move=="up" then return "down" elseif move=="down" then return "up" end return nil end
 
 -- ---------- shape/bounds ----------
@@ -128,45 +111,12 @@ local function insideShape(job,p)
 end
 local function corridorBetween(a,b,p,pad) if not a or not b or not p then return false end pad=pad or 1; local c={minX=math.min(a.x,b.x)-pad,maxX=math.max(a.x,b.x)+pad,minY=math.min(a.y,b.y)-pad,maxY=math.max(a.y,b.y)+pad,minZ=math.min(a.z,b.z)-pad,maxZ=math.max(a.z,b.z)+pad}; return inBox(c,p) end
 local function originPos() if not state.job or not state.task then return nil end return {x=state.job.origin.x,y=state.task.travelY,z=state.job.origin.z} end
-local function transitPad() return math.max(2, (BYPASS_LIMIT or 5) + 1) end
-local function inOriginCorridor(p)
-  local o=originPos()
-  return o and (samePos(p,o) or corridorBetween(state.home or o,o,p,transitPad()) or insideShape(state.job,p))
-end
-local function inHomeCorridor(p)
-  local o=originPos()
-  return samePos(p,state.home) or corridorBetween(o or state.pos,state.home,p,transitPad())
-end
-
--- The first step out of the home rack can be slightly different from the
--- long home->origin corridor. A parked miner may need to step one or two
--- blocks sideways/backward before the normal route planner can find the
--- corridor to origin. This is only allowed while leaving home for origin.
-local function inDockEscapeZone(p)
-  if not p or not state.home then return false end
-  if p.y ~= state.home.y then return false end
-  local dx = math.abs((p.x or 0) - (state.home.x or 0))
-  local dz = math.abs((p.z or 0) - (state.home.z or 0))
-  return dx <= 2 and dz <= 2
-end
-
 local function allowedTarget(p, reason)
   if not p then return false,"nil target" end
   if state.rogue then return false,"rogue lock active" end
-  if reason=="home" or state.routePhase=="to_home" then
-    if inHomeCorridor(p) then return true end
-    return false,"outside origin-home corridor"
-  end
-  if reason=="origin" or state.routePhase=="to_origin" then
-    if inOriginCorridor(p) or inDockEscapeZone(p) then return true end
-    return false,"outside origin corridor"
-  end
-  if reason=="bypass" then
-    if state.routePhase=="to_origin" and inOriginCorridor(p) then return true end
-    if state.routePhase=="to_home" and inHomeCorridor(p) then return true end
-    if insideShape(state.job,p) then return true end
-    return false,"bypass would leave permitted area"
-  end
+  if reason=="home" or state.routePhase=="to_home" then local o=originPos(); if samePos(p,state.home) or corridorBetween(o or state.pos,state.home,p,2) then return true end return false,"outside origin-home corridor" end
+  if reason=="origin" or state.routePhase=="to_origin" then local o=originPos(); if o and (samePos(p,o) or corridorBetween(state.home or o,o,p,2) or insideShape(state.job,p)) then return true end return false,"outside origin corridor" end
+  if reason=="bypass" then if insideShape(state.job,p) then return true end return false,"bypass would leave work volume" end
   if state.job then if insideShape(state.job,p) then return true end return false,"movement would leave job volume" end
   if state.home and corridorBetween(state.home,state.pos,p,2) then return true end
   return false,"no active job corridor allows target"
@@ -230,10 +180,31 @@ end
 local function needsService() if not validFuelSlot() then return true,"fuel" end if not hasFiller() then return true,"filler" end if state.job and state.job.torchMode=="replaced" and not validTorchSlot(true) then return true,"torches" end local full=true; for s=WORK_SLOTS_MIN,WORK_SLOTS_MAX do if turtle.getItemCount(s)==0 then full=false break end end if full then return true,"inventory full" end return false,nil end
 local function fuelIfNeeded() if turtle.getFuelLevel and turtle.getFuelLevel()~="unlimited" and turtle.getFuelLevel()<100 then local n,c=itemName(FUEL_SLOT); if VALID_FUEL[n] and c>0 then turtle.select(FUEL_SLOT); turtle.refuel(1) end end end
 
+local function ensureFuelForMove()
+  if not turtle.getFuelLevel then return true end
+  local lvl = turtle.getFuelLevel()
+  if lvl == "unlimited" or lvl > 0 then return true end
+  local n,c = itemName(FUEL_SLOT)
+  if not VALID_FUEL[n] or c <= 0 then return false end
+  local previous = turtle.getSelectedSlot()
+  turtle.select(FUEL_SLOT)
+  local ok = turtle.refuel(1)
+  turtle.select(previous)
+  if not ok then return false end
+  lvl = turtle.getFuelLevel()
+  return lvl == "unlimited" or lvl > 0
+end
+
 -- ---------- raw movement, lava, dig ----------
 local function inspectForDir(dir) if dir=="up" then return blockName("up") elseif dir=="down" then return blockName("down") else return blockName("forward") end end
-local function turtleMove(dir) if dir=="up" then return turtle.up() elseif dir=="down" then return turtle.down() else return turtle.forward() end end
-local function turtleBack() return turtle.back() end
+local function turtleMove(dir)
+  if not ensureFuelForMove() then return false end
+  if dir=="up" then return turtle.up() elseif dir=="down" then return turtle.down() else return turtle.forward() end
+end
+local function turtleBack()
+  if not ensureFuelForMove() then return false end
+  return turtle.back()
+end
 local function rawMove(dir, reason, allowDig, allowBypass)
   if shouldInterruptMovement() then return false end
   if not gpsCheck(false) then return false end
@@ -252,6 +223,7 @@ local function rawMove(dir, reason, allowDig, allowBypass)
       if allowDig then if dir=="up" then if not turtle.digUp() then return reportProblem("Dig up failed",{target=target,name=n}) end elseif dir=="down" then if not turtle.digDown() then return reportProblem("Dig down failed",{target=target,name=n}) end else if not turtle.dig() then return reportProblem("Dig forward failed",{target=target,name=n}) end end; state.stats.mined=(state.stats.mined or 0)+1 else return reportProblem("Path blocked and digging disabled: "..n,{target=target}) end
     end
   end
+  if not ensureFuelForMove() then return reportProblem("No fuel for movement",{target=target}) end
   if not turtleMove(dir) then return reportProblem("Move failed "..dir,{target=target}) end
   state.pos=target; state.lastSafePos=copy(target); state.movesSinceGps=(state.movesSinceGps or 0)+1; saveState(); return gpsCheck(false)
 end
@@ -264,65 +236,6 @@ function handleLava(dir,target)
   local inside=state.job and insideShape(state.job,target)
   if inside then if dir=="up" then turtle.digUp() elseif dir=="down" then turtle.digDown() else turtle.dig() end end
   return true
-end
-
-
--- Route movement is intentionally non-fatal.  A normal moveChecked()/rawMove()
--- reports TASK_PROBLEM when turtle.forward() returns false.  That is correct
--- while mining, but wrong while planning home->origin travel: another turtle,
--- a player, or a just-updated block can make forward fail even when the route
--- should simply be retried or replanned.  This function either completes one
--- forward step, or returns a reason/target for the route planner to mark blocked.
-local function routeForwardStep(reason)
-  if shouldInterruptMovement() then return false,"interrupted",targetForDir("forward") end
-  if not gpsCheck(false) then return false,"gps",targetForDir("forward") end
-
-  local before = copy(state.pos)
-  local intended = targetForDir("forward")
-  local ok, why = allowedTarget(intended, reason)
-  if not ok then return false, why or "not_allowed", intended end
-
-  for attempt=1,6 do
-    local n = blockName("forward")
-    if n then
-      if isProtectedName(n) or (isTorchName(n) and state.job and state.job.torchMode=="ignored") then
-        return false,"blocked_protected",intended,n
-      end
-      if isTorchName(n) and state.job and state.job.torchMode=="replaced" and state.task and state.task.passIndex>1 then
-        return false,"blocked_preserved_torch",intended,n
-      end
-      if n=="minecraft:lava" or n=="minecraft:flowing_lava" then
-        if not handleLava("forward", intended) then return false,"lava",intended,n end
-      else
-        if not turtle.dig() then return false,"dig_failed",intended,n end
-        state.stats.mined=(state.stats.mined or 0)+1
-      end
-    end
-
-    if turtle.forward() then
-      local actual = locate(0.75) or intended
-      local inferred = facingFromDelta(before, actual)
-      if inferred then state.facing = inferred end
-      local okActual, whyActual = allowedTarget(actual, reason)
-      if not okActual then
-        -- We moved, but GPS says the physical move was not legal. Undo if possible.
-        turtle.back()
-        state.pos = before
-        saveState()
-        return false, whyActual or "actual_target_not_allowed", actual
-      end
-      state.pos=actual
-      state.lastSafePos=copy(actual)
-      state.movesSinceGps=(state.movesSinceGps or 0)+1
-      saveState()
-      if not gpsCheck(false) then return false,"gps_after_move",actual end
-      return true,nil,actual
-    end
-
-    sleep(0.25)
-  end
-
-  return false,"move_failed_transient",intended
 end
 
 local returnToOrigin
@@ -493,124 +406,6 @@ local function routeInsideJob(target, reason)
   return gpsCheck(false)
 end
 
-local function planPathAllowed(target, reason, blocked)
-  if not target or not state.pos then return nil,"no target/current position" end
-  if state.pos.y ~= target.y then return nil,"path planner requires same Y" end
-  local start={x=state.pos.x,y=state.pos.y,z=state.pos.z}
-  local goal={x=target.x,y=target.y,z=target.z}
-  if samePos(start,goal) then return {} end
-  local okStart,whyStart=allowedTarget(start,reason)
-  local okGoal,whyGoal=allowedTarget(goal,reason)
-  if not okStart then return nil,"current position not allowed: "..tostring(whyStart) end
-  if not okGoal then return nil,"target not allowed: "..tostring(whyGoal) end
-
-  local pad=transitPad()+2
-  local minX=math.min(start.x,goal.x)-pad
-  local maxX=math.max(start.x,goal.x)+pad
-  local minZ=math.min(start.z,goal.z)-pad
-  local maxZ=math.max(start.z,goal.z)+pad
-  if state.job and state.job.fullBounds then
-    minX=math.min(minX,state.job.fullBounds.minX-pad)
-    maxX=math.max(maxX,state.job.fullBounds.maxX+pad)
-    minZ=math.min(minZ,state.job.fullBounds.minZ-pad)
-    maxZ=math.max(maxZ,state.job.fullBounds.maxZ+pad)
-  end
-
-  local function k(x,z) return tostring(x)..","..tostring(z) end
-  local q={{x=start.x,z=start.z}}
-  local qi=1
-  local startKey=k(start.x,start.z)
-  local goalKey=k(goal.x,goal.z)
-  local came={[startKey]=false}
-  local cameDir={}
-  local dirs={{name="east",dx=1,dz=0},{name="west",dx=-1,dz=0},{name="south",dx=0,dz=1},{name="north",dx=0,dz=-1}}
-  local nodes,maxNodes=0,50000
-  while qi<=#q do
-    local cur=q[qi]; qi=qi+1; nodes=nodes+1
-    if nodes>maxNodes then return nil,"path search exceeded safety limit" end
-    for _,d in ipairs(dirs) do
-      local nx,nz=cur.x+d.dx,cur.z+d.dz
-      if nx>=minX and nx<=maxX and nz>=minZ and nz<=maxZ then
-        local np={x=nx,y=start.y,z=nz}
-        local ok=allowedTarget(np,reason)
-        if ok then
-          local nk=k(nx,nz)
-          if (not blocked or not blocked[nk]) and came[nk]==nil then
-            came[nk]=k(cur.x,cur.z)
-            cameDir[nk]=d.name
-            if nk==goalKey then
-              local out={}
-              local walk=nk
-              while walk~=startKey do
-                table.insert(out,1,cameDir[walk])
-                walk=came[walk]
-              end
-              return out
-            end
-            q[#q+1]={x=nx,z=nz}
-          end
-        end
-      end
-    end
-  end
-  return nil,"no permitted corridor route to target"
-end
-
-local function routeAllowed(target, reason)
-  local blocked = {}
-  local replans = 0
-  local maxReplans = 64
-
-  while replans <= maxReplans do
-    local path,why=planPathAllowed(target,reason,blocked)
-    if not path then
-      return reportProblem("No valid permitted route: "..tostring(why),{target=target,reason=reason})
-    end
-
-    state.status=(reason=="origin") and "MOVING_TO_ORIGIN" or "PATHING"
-    saveState(); heartbeat()
-
-    local hitBlocked = false
-    for _,f in ipairs(path) do
-      if shouldInterruptMovement() then return false end
-      face(f)
-
-      local stepTarget = targetForDir("forward")
-      local n = blockName("forward")
-
-      -- During home/origin corridor pathing, a parked turtle/chest/monitor/etc.
-      -- is not a task-ending problem. Treat that coordinate as blocked, replan,
-      -- and try another legal corridor path. This is what lets the third miner
-      -- route around the home rack instead of marking the quadrant Problem.
-      if n and (isProtectedName(n) or (isTorchName(n) and state.job and state.job.torchMode=="ignored")) then
-        blocked[keyXZ(stepTarget.x, stepTarget.z)] = true
-        report("ROUTE_BLOCKED",{name=n,pos=copy(state.pos),target=copy(stepTarget),reason=reason,taskId=state.task and state.task.id})
-        hitBlocked = true
-        replans = replans + 1
-        break
-      end
-
-      local moved, moveWhy, moveTarget, moveBlock = routeForwardStep(reason)
-      if not moved then
-        local blockedTarget = moveTarget or stepTarget
-        blocked[keyXZ(blockedTarget.x, blockedTarget.z)] = true
-        report("ROUTE_REPLAN",{reason=moveWhy,block=moveBlock,pos=copy(state.pos),target=copy(blockedTarget),routeReason=reason,taskId=state.task and state.task.id})
-        replans = replans + 1
-        hitBlocked = true
-        break
-      end
-    end
-
-    if not hitBlocked then
-      return gpsCheck(false)
-    end
-
-    sleep(0.2)
-  end
-
-  return reportProblem("No valid permitted route after replanning around blocked corridor",{target=target,reason=reason})
-end
-
 -- ---------- routing ----------
 function goY(y, reason)
   while state.pos.y<y do if shouldInterruptMovement() then return false end; if not moveChecked("up",reason) then return false end end
@@ -627,136 +422,29 @@ function goZ(z, reason)
   while state.pos.z>z do if shouldInterruptMovement() then return false end; face("north"); if not moveChecked("forward",reason) then return false end end
   return true
 end
-local function undockFromHomeForOrigin(target)
-  if not state.home or not state.pos or not samePos(state.pos, state.home) then return true end
-  state.status = "UNDOCKING"
-  saveState(); heartbeat()
-
-  -- Do not depend on saved facing here. If a turtle was picked up, rotated,
-  -- restored from state, or desynced by a failed move, the saved facing can be
-  -- wrong.  Try physical forward/back moves while rotating through all four
-  -- physical directions, then infer facing from GPS after the first successful
-  -- horizontal move. This is intentionally non-destructive: it never digs while
-  -- leaving the home rack.
-  local startPos = locate(1) or copy(state.pos)
-  state.pos = copy(startPos)
-
-  local function acceptUndockMove(actual, movedBackward)
-    if not actual then return false,"no_gps_after_undock" end
-    local dx = math.abs((actual.x or 0) - (state.home.x or 0))
-    local dz = math.abs((actual.z or 0) - (state.home.z or 0))
-    if actual.y ~= state.home.y or dx > 6 or dz > 6 then
-      return false,"undock_left_home_escape_zone"
-    end
-    local moveFacing = facingFromDelta(startPos, actual)
-    if moveFacing then
-      state.facing = movedBackward and oppositeFacing(moveFacing) or moveFacing
-    end
-    state.pos = actual
-    state.lastSafePos = copy(actual)
-    saveState()
-    report("UNDOCKED", {pos=copy(state.pos), inferredFacing=state.facing, backward=movedBackward, taskId=state.task and state.task.id})
-    return true
-  end
-
-  for turn=1,4 do
-    if shouldInterruptMovement() then return false end
-
-    local n = blockName("forward")
-    if not n or not isProtectedName(n) then
-      if turtle.forward() then
-        local actual = locate(1)
-        local ok,why = acceptUndockMove(actual, false)
-        if ok then return true end
-        turtle.back()
-        state.pos = copy(startPos)
-        report("UNDOCK_REJECTED", {reason=why, pos=actual})
-      else
-        report("UNDOCK_FORWARD_FAILED", {facing=state.facing, block=n})
-      end
-    else
-      report("UNDOCK_FORWARD_BLOCKED", {facing=state.facing, block=n})
-    end
-
-    -- Try backing out too. This is important for rack layouts where the
-    -- turtle's saved facing points into another turtle/chest but the aisle is
-    -- behind it. turtle.back() cannot inspect first, so verify by GPS after.
-    if turtle.back() then
-      local actual = locate(1)
-      local ok,why = acceptUndockMove(actual, true)
-      if ok then return true end
-      turtle.forward()
-      state.pos = copy(startPos)
-      report("UNDOCK_REJECTED", {reason=why, pos=actual, backward=true})
-    else
-      report("UNDOCK_BACK_FAILED", {facing=state.facing})
-    end
-
-    turnRight()
-  end
-
-  state.pos = copy(startPos)
-  saveState()
-  return reportProblem("Could not undock from home rack", {home=copy(state.home), target=copy(target), note="No physical forward/back move succeeded from home"})
-end
-
 function goTo(p, reason)
   if not gpsCheck(true) then return false end
   if not p then return false end
 
-  -- IMPORTANT: when leaving the home rack for origin, do NOT change Y first.
-  -- The miner is normally sitting above its deposit chest. If task travelY is
-  -- one block lower than home, a Y-first route tries to move down into that
-  -- protected chest and immediately fails as "Could not reach origin".
-  -- Instead, travel horizontally through the permitted home->origin corridor
-  -- at the miner's current/home Y, then descend/ascend only once aligned with
-  -- the job origin X/Z.
-  if state.job and state.pos and reason == "origin" and state.pos.y ~= p.y then
-    local via = {x = p.x, y = state.pos.y, z = p.z}
-    if not undockFromHomeForOrigin(via) then return false end
-    if not routeAllowed(via, "origin") then return false end
-    if state.pos.y ~= p.y then
-      if not goY(p.y, "origin") then return false end
-    end
-    return gpsCheck(true)
-  end
-
-  -- Returning home is the opposite: get back to the saved home Y first while
-  -- still away from the rack, then use the permitted corridor to reach home.
-  if state.job and state.pos and reason == "home" and state.pos.y ~= p.y then
-    if not goY(p.y, "home") then return false end
-  end
-
-  if state.pos.y ~= p.y then
-    if not goY(p.y,reason) then return false end
-  end
-
-  -- Home/origin travel uses a permitted-corridor planner, not blind X-then-Z.
-  -- This lets miners leave the home rack in sequence and route around parked
-  -- turtles/chests while staying inside the approved home<->origin corridor.
-  if state.job and state.pos and p.y == state.pos.y and (reason=="origin" or reason=="home") then
-    if reason == "origin" and not undockFromHomeForOrigin(p) then return false end
-    local ok = routeAllowed(p, reason)
-    if ok and reason == "home" and state.homeFacing then
-      face(state.homeFacing)
-      saveState()
-    end
-    return ok
-  end
-
-  -- Work/bypass travel inside shaped jobs must not use blind X-then-Z routing.
-  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass") then
+  -- Work/origin travel inside shaped jobs must not use blind X-then-Z routing.
+  -- For circles, domes, cones, stretched cylinders, etc., a straight axis route can
+  -- briefly step outside the shape even though another legal route exists. Plan the
+  -- horizontal route inside the work volume instead.
+  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass" or reason=="origin") then
     return routeInsideJob(p, reason)
   end
 
+  -- If vertical movement is needed, change Y first only when each vertical step is
+  -- still legal. After reaching the target Y, use the in-volume router when possible.
+  if not goY(p.y,reason) then return false end
+  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass" or reason=="origin") then
+    return routeInsideJob(p, reason)
+  end
+
+  -- Non-work routes, such as explicit home corridors, keep the older corridor logic.
   if not goX(p.x,reason) then return false end
   if not goZ(p.z,reason) then return false end
-  local ok = gpsCheck(true)
-  if ok and reason == "home" and state.homeFacing then
-    face(state.homeFacing)
-    saveState()
-  end
-  return ok
+  return gpsCheck(true)
 end
 
 -- ---------- home setup ----------
@@ -875,10 +563,7 @@ local function emergencyReturn(reason)
   local ok = state.home and pcall(function() return goTo(state.home,"home") end)
   local at = false; if ok then gpsCheck(true); at=isAtHome() end
   if not at then markRogue(reason or "Emergency return failed") end
-  if state.homeFacing then
-    face(state.homeFacing)
-  end
-  state.status="AT_HOME"; state.killMode=false; state.routePhase="idle"; saveState(); heartbeat(); report("AT_HOME",{emergency=true,pos=copy(state.pos),facing=state.facing})
+  state.status="AT_HOME"; state.killMode=false; state.routePhase="idle"; saveState(); heartbeat(); report("AT_HOME",{emergency=true,pos=copy(state.pos)})
 end
 function handlePacket(id,msg)
   if not validPacket(msg) then return end
@@ -899,7 +584,7 @@ end
 local function networkLoop() while running do local id,msg=rednet.receive(PROTOCOL,1); if id then handlePacket(id,msg) end end end
 local function heartbeatLoop() while running do heartbeat(); sleep(HEARTBEAT_INTERVAL) end end
 local function workLoop() while running do if state.rogue then sleep(2) elseif returnRequested then emergencyReturn(returnReason or "Return requested") elseif state.job and state.task and not paused then workTask() else sleep(1) end end end
-local function displayLoop() while running do header("Status"); print("ID: "..os.getComputerID()); print("Status: "..tostring(state.status)); term.write("Pos: "); writeCoord(state.pos); print(""); term.write("Home: "); writeCoord(state.home); print(""); print("Facing: "..tostring(state.facing)); print("GPS: "..tostring(state.gpsValid).."  Home valid: "..tostring(state.homeValid)); print("Inventory valid: "..tostring(state.inventoryValid)); print("Protected rev: "..tostring(state.protectedRevision)); print("Task: "..tostring(state.task and state.task.id or "none")); if state.rogue then color(colors.red); print("ROGUE LOCK: place turtle at saved home and reboot."); color(colors.lightGray) end if state.lastProblem then color(colors.red); print("Problem: "..tostring(state.lastProblem)); color(colors.lightGray) end sleep(2) end end
+local function displayLoop() while running do header("Status"); print("ID: "..os.getComputerID()); print("Status: "..tostring(state.status)); term.write("Pos: "); writeCoord(state.pos); print(""); term.write("Home: "); writeCoord(state.home); print(""); print("Facing: "..tostring(state.facing)); print("GPS: "..tostring(state.gpsValid).."  Home valid: "..tostring(state.homeValid)); print("Inventory valid: "..tostring(state.inventoryValid)); print("Protected rev: "..tostring(state.protectedRevision)); print("Task: "..tostring(state.task and state.task.id or "none")); if turtle.getFuelLevel then print("Fuel level: "..tostring(turtle.getFuelLevel())) end; if state.rogue then color(colors.red); print("ROGUE LOCK: place turtle at saved home and reboot."); color(colors.lightGray) end if state.lastProblem then color(colors.red); print("Problem: "..tostring(state.lastProblem)); color(colors.lightGray) end sleep(2) end end
 
 -- ---------- boot ----------
 local function boot()
@@ -907,17 +592,6 @@ local function boot()
   local ok,why=gpsQuorum(); if not ok then print("GPS invalid: "..tostring(why)); sleep(2); return false end
   if state.rogue then if state.home and samePos(state.pos,state.home) then state.rogue=false; state.status="AT_HOME"; pcall(os.setComputerLabel,"Miner-"..os.getComputerID()); saveState() else header("ROGUE LOCK"); print("This turtle was marked Rogue."); print("Saved home:"); writeCoord(state.home); print(""); print("Current GPS:"); writeCoord(state.pos); print(""); print("Place it back at saved home and reboot."); return false end end
   if not state.homeValid or not state.home then if not setupHome() then return false end else state.atHome=samePos(state.pos,state.home); if not state.atHome then header("Not At Home"); print("Saved home:"); writeCoord(state.home); print(""); print("Current:"); writeCoord(state.pos); print(""); print("Move turtle back home or clear data."); return false end end
-
-  -- A previous build could leave a turtle in PROBLEM with no active task after
-  -- a home-to-origin traffic jam. If it is physically back home, clear that
-  -- transient local problem so the controller can use it again.
-  if state.status == "PROBLEM" and not state.task and state.atHome and not state.rogue then
-    state.status = "AT_HOME"
-    state.lastProblem = nil
-    state.lastProblemPos = nil
-    saveState()
-  end
-
   if not serviceInventory() then header("Inventory"); print("Could not validate fuel/filler/torches from upper chest."); sleep(2) end
   state.status=state.inventoryValid and "AT_HOME" or "NEEDS_SUPPLIES"; saveState(); register(); return true
 end
