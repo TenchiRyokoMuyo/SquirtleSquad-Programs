@@ -15,6 +15,7 @@ local HEARTBEAT_INTERVAL = 5
 local GPS_CHECK_MOVES = 8
 local CONTROLLER_TIMEOUT = 10
 local ORIGIN_LOCK_TIMEOUT = 60
+local TRANSIT_LOCK_TIMEOUT = 600
 local BYPASS_LIMIT = 5
 
 local VALID_FUEL = { ["minecraft:coal"] = true, ["minecraft:charcoal"] = true }
@@ -30,7 +31,7 @@ local state = {
   lastSafePos = nil, homeValid = false, inventoryValid = false, gpsValid = false, atHome = false,
   protectedRevision = 0, protectedExact = {}, protectedContains = {},
   assignment = nil, job = nil, task = nil, movesSinceGps = 0,
-  routePhase = "idle", originLockHeld = false, rogue = false, killMode = false,
+  routePhase = "idle", originLockHeld = false, transitLockHeld = false, transitLockId = nil, rogue = false, killMode = false,
   lastProblem = nil, lastProblemPos = nil, stats = { mined=0, bypasses=0, rollbacks=0, serviced=0 },
 }
 
@@ -62,7 +63,7 @@ local function safePacket(packet) if type(packet)~="table" then return nil end l
 local function send(id,p) local q=safePacket(p); if not q then return false end return rednet.send(id,q,PROTOCOL) end
 local function broadcast(p) local q=safePacket(p); if not q then return false end rednet.broadcast(q,PROTOCOL); return true end
 local function validPacket(p) return type(p)=="table" and p.project==PROJECT and p.protocol==PROTOCOL and type(p.type)=="string" end
-local function heartbeat() local pl={role=ROLE,status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.homeValid,inventoryValid=state.inventoryValid,gpsValid=state.gpsValid,atHome=state.atHome,protectedRevision=state.protectedRevision,rogue=state.rogue,originLockHeld=state.originLockHeld,lastProblem=state.lastProblem}; if state.controllerId then send(state.controllerId,{type="HEARTBEAT",payload=pl}) else broadcast({type="HEARTBEAT",payload=pl}) end end
+local function heartbeat() local pl={role=ROLE,status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.homeValid,inventoryValid=state.inventoryValid,gpsValid=state.gpsValid,atHome=state.atHome,protectedRevision=state.protectedRevision,rogue=state.rogue,originLockHeld=state.originLockHeld,transitLockHeld=state.transitLockHeld,lastProblem=state.lastProblem}; if state.controllerId then send(state.controllerId,{type="HEARTBEAT",payload=pl}) else broadcast({type="HEARTBEAT",payload=pl}) end end
 local function register() broadcast({type="REGISTER",payload={role=ROLE,label=os.getComputerLabel(),status=state.status,pos=copy(state.pos),home=copy(state.home),homeValid=state.homeValid,inventoryValid=state.inventoryValid,gpsValid=state.gpsValid,atHome=state.atHome,protectedRevision=state.protectedRevision,rogue=state.rogue}}) end
 local function report(typeName, payload) if state.controllerId then send(state.controllerId,{type=typeName,payload=payload or {}}) else broadcast({type=typeName,payload=payload or {}}) end end
 local function requestReturnHome(reason) returnRequested=true; returnReason=reason or "Return requested"; state.status="RETURN_REQUESTED"; saveState(); heartbeat() end
@@ -156,6 +157,7 @@ end
 local function markRogue(reason) state.rogue=true; state.status="ROGUE"; state.lastProblem=reason; state.lastProblemPos=copy(state.pos); saveState(); pcall(os.setComputerLabel,"ROGUE-Miner-"..os.getComputerID()); report("ROGUE",{reason=reason,pos=copy(state.pos),home=copy(state.home),taskId=state.task and state.task.id}); error("ROGUE: "..tostring(reason),0) end
 
 -- ---------- inventory / service ----------
+local claimTransitLock, releaseTransitLock
 local function itemName(slot) local d=turtle.getItemDetail(slot); if d then return d.name,d.count,d end return nil,0,nil end
 local function hasFiller() local n,c=itemName(FILLER_SLOT); return n and c and c>0 end
 local function validFuelSlot() local n,c=itemName(FUEL_SLOT); return VALID_FUEL[n] and c>=8 end
@@ -165,7 +167,14 @@ local function pullSlot(slot, validSet, want) turtle.select(slot); local n,c=ite
 local function serviceInventory()
   if not state.home then return reportProblem("No saved home for service") end
   state.status="SERVICING"; state.routePhase="to_home"; saveState(); heartbeat()
-  if not goTo(state.home,"home") then markRogue("Unable to return home for service") end
+  if not samePos(state.pos,state.home) then
+    state.status="WAITING_TRANSIT_HOME"; saveState(); heartbeat()
+    local okLock, whyLock = claimTransitLock("to_home")
+    if not okLock then return reportProblem("Could not claim home transit queue: "..tostring(whyLock)) end
+    local okHome = goTo(state.home,"home")
+    releaseTransitLock()
+    if not okHome then markRogue("Unable to return home for service") end
+  end
   if not gpsCheck(true) or not samePos(state.pos,state.home) then markRogue("GPS did not confirm home during service") end
   face(state.homeFacing)
   for s=WORK_SLOTS_MIN,WORK_SLOTS_MAX do turtle.select(s); if turtle.getItemCount(s)>0 then turtle.dropDown() end end
@@ -477,6 +486,44 @@ local function claimOriginLock()
 end
 local function releaseOriginLock() if state.originLockHeld and state.controllerId then send(state.controllerId,{type="ORIGIN_LOCK_RELEASE",payload={jobId=state.job and state.job.id,taskId=state.task and state.task.id}}) end state.originLockHeld=false; saveState() end
 
+
+claimTransitLock = function(purpose)
+  if not state.controllerId then return false,"no controller" end
+  local lockId = tostring(os.getComputerID())..":"..tostring(purpose or "transit")..":"..tostring(state.task and state.task.id or "none")..":"..tostring(now())
+  state.transitLockId = lockId
+  state.status = purpose == "to_home" and "QUEUED_TO_HOME" or "QUEUED_TO_ORIGIN"
+  saveState(); heartbeat()
+  send(state.controllerId,{type="TRANSIT_LOCK_REQUEST",payload={lockId=lockId,purpose=purpose or "transit",jobId=state.job and state.job.id,taskId=state.task and state.task.id,pos=copy(state.pos)}})
+  local deadline=os.clock()+TRANSIT_LOCK_TIMEOUT
+  while os.clock()<deadline do
+    local id,msg=rednet.receive(PROTOCOL,1)
+    if id and validPacket(msg) then
+      handlePacket(id,msg)
+      if msg.type=="TRANSIT_LOCK_GRANTED" and msg.payload and msg.payload.lockId==lockId then
+        state.transitLockHeld=true; state.transitLockId=lockId
+        state.status = purpose == "to_home" and "MOVING_HOME" or "MOVING_TO_ORIGIN"
+        saveState(); heartbeat()
+        return true
+      elseif msg.type=="TRANSIT_LOCK_WAIT" and msg.payload and msg.payload.lockId==lockId then
+        state.status = (purpose == "to_home" and "QUEUED_TO_HOME" or "QUEUED_TO_ORIGIN") .. " #" .. tostring(msg.payload.position or "?")
+        saveState(); heartbeat()
+      end
+    end
+    if paused and purpose ~= "to_home" then return false,"paused" end
+    sleep(0.1)
+  end
+  return false,"transit lock timeout"
+end
+
+releaseTransitLock = function()
+  if state.transitLockHeld and state.controllerId then
+    send(state.controllerId,{type="TRANSIT_LOCK_RELEASE",payload={lockId=state.transitLockId,jobId=state.job and state.job.id,taskId=state.task and state.task.id,pos=copy(state.pos)}})
+  end
+  state.transitLockHeld=false
+  state.transitLockId=nil
+  saveState(); heartbeat()
+end
+
 -- ---------- torch placement ----------
 local function placeTorchIfNeeded(x,z)
   if not state.job or state.job.torchMode~="replaced" then return end
@@ -551,7 +598,15 @@ local function mineColumnAt(x,z)
 end
 returnToOrigin = function()
   local o=originPos(); if not o then return false end
-  state.routePhase="to_origin"; state.status="MOVING_TO_ORIGIN"; saveState(); local ok=goTo(o,"origin"); state.routePhase="idle"; if ok then report("AT_ORIGIN",{pos=copy(state.pos),taskId=state.task and state.task.id}) end return ok
+  if samePos(state.pos,o) then report("AT_ORIGIN",{pos=copy(state.pos),taskId=state.task and state.task.id}); return true end
+  local okLock, whyLock = claimTransitLock("to_origin")
+  if not okLock then return reportProblem("Could not claim origin transit queue: "..tostring(whyLock)) end
+  state.routePhase="to_origin"; state.status="MOVING_TO_ORIGIN"; saveState(); heartbeat()
+  local ok=goTo(o,"origin")
+  state.routePhase="idle"
+  releaseTransitLock()
+  if ok then report("AT_ORIGIN",{pos=copy(state.pos),taskId=state.task and state.task.id}) end
+  return ok
 end
 local function workTask()
   if returnRequested then return false end
@@ -573,7 +628,12 @@ local function emergencyReturn(reason)
   state.killMode=true; state.status="EMERGENCY_RETURN"; saveState(); heartbeat(); paused=false
   if state.job and state.task then pcall(returnToOrigin) end
   state.routePhase="to_home"
-  local ok = state.home and pcall(function() return goTo(state.home,"home") end)
+  local ok = false
+  if state.home then
+    if not isAtHome() then pcall(function() claimTransitLock("to_home") end) end
+    ok = pcall(function() return goTo(state.home,"home") end)
+    releaseTransitLock()
+  end
   local at = false; if ok then gpsCheck(true); at=isAtHome() end
   if not at then markRogue(reason or "Emergency return failed") end
   state.status="AT_HOME"; state.killMode=false; state.routePhase="idle"; saveState(); heartbeat(); report("AT_HOME",{emergency=true,pos=copy(state.pos)})
