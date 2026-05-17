@@ -307,6 +307,83 @@ function attemptBypassProtected(name, reason)
 end
 local function moveChecked(dir, reason) return rawMove(dir, reason, true, true) end
 
+-- Plan an X/Z route that stays inside the active job volume.
+-- This is used whenever straight-line X-then-Z or Z-then-X travel would clip
+-- outside a cylinder/dome/cone/stretched shape. It does not allow the miner to
+-- leave the work area; every planned step must pass insideShape(job, pos).
+local function keyXZ(x,z) return tostring(x)..","..tostring(z) end
+local function planPathInsideJob(target)
+  if not state.job or not target or not state.pos then return nil,"no active job" end
+  if state.pos.y ~= target.y then return nil,"path planner requires same Y" end
+  local y = state.pos.y
+  local start = {x=state.pos.x,y=y,z=state.pos.z}
+  local goal = {x=target.x,y=y,z=target.z}
+  if samePos(start, goal) then return {} end
+  if not insideShape(state.job,start) then return nil,"current position is outside job volume" end
+  if not insideShape(state.job,goal) then return nil,"target is outside job volume" end
+
+  local b = state.job.fullBounds
+  if not b then return nil,"job has no full bounds" end
+
+  local q = {{x=start.x,z=start.z}}
+  local qi = 1
+  local startKey = keyXZ(start.x,start.z)
+  local goalKey = keyXZ(goal.x,goal.z)
+  local came = {[startKey] = false}
+  local cameDir = {}
+  local nodes = 0
+  local maxNodes = 50000
+  local dirs = {
+    {name="east",  dx= 1, dz= 0},
+    {name="west",  dx=-1, dz= 0},
+    {name="south", dx= 0, dz= 1},
+    {name="north", dx= 0, dz=-1},
+  }
+
+  while qi <= #q do
+    local cur = q[qi]; qi = qi + 1
+    nodes = nodes + 1
+    if nodes > maxNodes then return nil,"path search exceeded safety limit" end
+
+    for _,d in ipairs(dirs) do
+      local nx,nz = cur.x + d.dx, cur.z + d.dz
+      if nx >= b.minX and nx <= b.maxX and nz >= b.minZ and nz <= b.maxZ then
+        local np = {x=nx,y=y,z=nz}
+        if insideShape(state.job,np) then
+          local k = keyXZ(nx,nz)
+          if came[k] == nil then
+            came[k] = keyXZ(cur.x,cur.z)
+            cameDir[k] = d.name
+            if k == goalKey then
+              local out = {}
+              local walk = k
+              while walk ~= startKey do
+                table.insert(out,1,cameDir[walk])
+                walk = came[walk]
+              end
+              return out
+            end
+            q[#q+1] = {x=nx,z=nz}
+          end
+        end
+      end
+    end
+  end
+  return nil,"no in-volume path to target"
+end
+
+local function routeInsideJob(target, reason)
+  local path, why = planPathInsideJob(target)
+  if not path then return reportProblem("No valid in-volume route: "..tostring(why),{target=target}) end
+  state.status="PATHING"; saveState(); heartbeat()
+  for _,f in ipairs(path) do
+    if shouldInterruptMovement() then return false end
+    face(f)
+    if not moveChecked("forward", reason or "work") then return false end
+  end
+  return gpsCheck(false)
+end
+
 -- ---------- routing ----------
 function goY(y, reason)
   while state.pos.y<y do if shouldInterruptMovement() then return false end; if not moveChecked("up",reason) then return false end end
@@ -323,7 +400,30 @@ function goZ(z, reason)
   while state.pos.z>z do if shouldInterruptMovement() then return false end; face("north"); if not moveChecked("forward",reason) then return false end end
   return true
 end
-function goTo(p, reason) if not gpsCheck(true) then return false end if not p then return false end if not goY(p.y,reason) then return false end if not goX(p.x,reason) then return false end if not goZ(p.z,reason) then return false end return gpsCheck(true) end
+function goTo(p, reason)
+  if not gpsCheck(true) then return false end
+  if not p then return false end
+
+  -- Work/origin travel inside shaped jobs must not use blind X-then-Z routing.
+  -- For circles, domes, cones, stretched cylinders, etc., a straight axis route can
+  -- briefly step outside the shape even though another legal route exists. Plan the
+  -- horizontal route inside the work volume instead.
+  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass" or reason=="origin") then
+    return routeInsideJob(p, reason)
+  end
+
+  -- If vertical movement is needed, change Y first only when each vertical step is
+  -- still legal. After reaching the target Y, use the in-volume router when possible.
+  if not goY(p.y,reason) then return false end
+  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass" or reason=="origin") then
+    return routeInsideJob(p, reason)
+  end
+
+  -- Non-work routes, such as explicit home corridors, keep the older corridor logic.
+  if not goX(p.x,reason) then return false end
+  if not goZ(p.z,reason) then return false end
+  return gpsCheck(true)
+end
 
 -- ---------- home setup ----------
 local function promptFacing() while true do header("Home Facing"); print("Set the direction this turtle is facing at home:"); print("1 north\n2 east\n3 south\n4 west"); local n=tonumber(read()); if n and ORDER[n] then return ORDER[n] end end end
