@@ -111,12 +111,32 @@ local function insideShape(job,p)
 end
 local function corridorBetween(a,b,p,pad) if not a or not b or not p then return false end pad=pad or 1; local c={minX=math.min(a.x,b.x)-pad,maxX=math.max(a.x,b.x)+pad,minY=math.min(a.y,b.y)-pad,maxY=math.max(a.y,b.y)+pad,minZ=math.min(a.z,b.z)-pad,maxZ=math.max(a.z,b.z)+pad}; return inBox(c,p) end
 local function originPos() if not state.job or not state.task then return nil end return {x=state.job.origin.x,y=state.task.travelY,z=state.job.origin.z} end
+local function transitPad() return math.max(2, (BYPASS_LIMIT or 5) + 1) end
+local function inOriginCorridor(p)
+  local o=originPos()
+  return o and (samePos(p,o) or corridorBetween(state.home or o,o,p,transitPad()) or insideShape(state.job,p))
+end
+local function inHomeCorridor(p)
+  local o=originPos()
+  return samePos(p,state.home) or corridorBetween(o or state.pos,state.home,p,transitPad())
+end
 local function allowedTarget(p, reason)
   if not p then return false,"nil target" end
   if state.rogue then return false,"rogue lock active" end
-  if reason=="home" or state.routePhase=="to_home" then local o=originPos(); if samePos(p,state.home) or corridorBetween(o or state.pos,state.home,p,2) then return true end return false,"outside origin-home corridor" end
-  if reason=="origin" or state.routePhase=="to_origin" then local o=originPos(); if o and (samePos(p,o) or corridorBetween(state.home or o,o,p,2) or insideShape(state.job,p)) then return true end return false,"outside origin corridor" end
-  if reason=="bypass" then if insideShape(state.job,p) then return true end return false,"bypass would leave work volume" end
+  if reason=="home" or state.routePhase=="to_home" then
+    if inHomeCorridor(p) then return true end
+    return false,"outside origin-home corridor"
+  end
+  if reason=="origin" or state.routePhase=="to_origin" then
+    if inOriginCorridor(p) then return true end
+    return false,"outside origin corridor"
+  end
+  if reason=="bypass" then
+    if state.routePhase=="to_origin" and inOriginCorridor(p) then return true end
+    if state.routePhase=="to_home" and inHomeCorridor(p) then return true end
+    if insideShape(state.job,p) then return true end
+    return false,"bypass would leave permitted area"
+  end
   if state.job then if insideShape(state.job,p) then return true end return false,"movement would leave job volume" end
   if state.home and corridorBetween(state.home,state.pos,p,2) then return true end
   return false,"no active job corridor allows target"
@@ -384,6 +404,82 @@ local function routeInsideJob(target, reason)
   return gpsCheck(false)
 end
 
+local function planPathAllowed(target, reason)
+  if not target or not state.pos then return nil,"no target/current position" end
+  if state.pos.y ~= target.y then return nil,"path planner requires same Y" end
+  local start={x=state.pos.x,y=state.pos.y,z=state.pos.z}
+  local goal={x=target.x,y=target.y,z=target.z}
+  if samePos(start,goal) then return {} end
+  local okStart,whyStart=allowedTarget(start,reason)
+  local okGoal,whyGoal=allowedTarget(goal,reason)
+  if not okStart then return nil,"current position not allowed: "..tostring(whyStart) end
+  if not okGoal then return nil,"target not allowed: "..tostring(whyGoal) end
+
+  local pad=transitPad()+2
+  local minX=math.min(start.x,goal.x)-pad
+  local maxX=math.max(start.x,goal.x)+pad
+  local minZ=math.min(start.z,goal.z)-pad
+  local maxZ=math.max(start.z,goal.z)+pad
+  if state.job and state.job.fullBounds then
+    minX=math.min(minX,state.job.fullBounds.minX-pad)
+    maxX=math.max(maxX,state.job.fullBounds.maxX+pad)
+    minZ=math.min(minZ,state.job.fullBounds.minZ-pad)
+    maxZ=math.max(maxZ,state.job.fullBounds.maxZ+pad)
+  end
+
+  local function k(x,z) return tostring(x)..","..tostring(z) end
+  local q={{x=start.x,z=start.z}}
+  local qi=1
+  local startKey=k(start.x,start.z)
+  local goalKey=k(goal.x,goal.z)
+  local came={[startKey]=false}
+  local cameDir={}
+  local dirs={{name="east",dx=1,dz=0},{name="west",dx=-1,dz=0},{name="south",dx=0,dz=1},{name="north",dx=0,dz=-1}}
+  local nodes,maxNodes=0,50000
+  while qi<=#q do
+    local cur=q[qi]; qi=qi+1; nodes=nodes+1
+    if nodes>maxNodes then return nil,"path search exceeded safety limit" end
+    for _,d in ipairs(dirs) do
+      local nx,nz=cur.x+d.dx,cur.z+d.dz
+      if nx>=minX and nx<=maxX and nz>=minZ and nz<=maxZ then
+        local np={x=nx,y=start.y,z=nz}
+        local ok=allowedTarget(np,reason)
+        if ok then
+          local nk=k(nx,nz)
+          if came[nk]==nil then
+            came[nk]=k(cur.x,cur.z)
+            cameDir[nk]=d.name
+            if nk==goalKey then
+              local out={}
+              local walk=nk
+              while walk~=startKey do
+                table.insert(out,1,cameDir[walk])
+                walk=came[walk]
+              end
+              return out
+            end
+            q[#q+1]={x=nx,z=nz}
+          end
+        end
+      end
+    end
+  end
+  return nil,"no permitted corridor route to target"
+end
+
+local function routeAllowed(target, reason)
+  local path,why=planPathAllowed(target,reason)
+  if not path then return reportProblem("No valid permitted route: "..tostring(why),{target=target,reason=reason}) end
+  state.status=(reason=="origin") and "MOVING_TO_ORIGIN" or "PATHING"
+  saveState(); heartbeat()
+  for _,f in ipairs(path) do
+    if shouldInterruptMovement() then return false end
+    face(f)
+    if not moveChecked("forward", reason) then return false end
+  end
+  return gpsCheck(false)
+end
+
 -- ---------- routing ----------
 function goY(y, reason)
   while state.pos.y<y do if shouldInterruptMovement() then return false end; if not moveChecked("up",reason) then return false end end
@@ -404,25 +500,35 @@ function goTo(p, reason)
   if not gpsCheck(true) then return false end
   if not p then return false end
 
-  -- Work/origin travel inside shaped jobs must not use blind X-then-Z routing.
-  -- For circles, domes, cones, stretched cylinders, etc., a straight axis route can
-  -- briefly step outside the shape even though another legal route exists. Plan the
-  -- horizontal route inside the work volume instead.
-  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass" or reason=="origin") then
+  if state.pos.y ~= p.y then
+    if not goY(p.y,reason) then return false end
+  end
+
+  -- Home/origin travel uses a permitted-corridor planner, not blind X-then-Z.
+  -- This lets miners leave the home rack in sequence and route around parked
+  -- turtles/chests while staying inside the approved home<->origin corridor.
+  if state.job and state.pos and p.y == state.pos.y and (reason=="origin" or reason=="home") then
+    local ok = routeAllowed(p, reason)
+    if ok and reason == "home" and state.homeFacing then
+      face(state.homeFacing)
+      saveState()
+    end
+    return ok
+  end
+
+  -- Work/bypass travel inside shaped jobs must not use blind X-then-Z routing.
+  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass") then
     return routeInsideJob(p, reason)
   end
 
-  -- If vertical movement is needed, change Y first only when each vertical step is
-  -- still legal. After reaching the target Y, use the in-volume router when possible.
-  if not goY(p.y,reason) then return false end
-  if state.job and state.pos and p.y == state.pos.y and insideShape(state.job,p) and (reason=="work" or reason=="bypass" or reason=="origin") then
-    return routeInsideJob(p, reason)
-  end
-
-  -- Non-work routes, such as explicit home corridors, keep the older corridor logic.
   if not goX(p.x,reason) then return false end
   if not goZ(p.z,reason) then return false end
-  return gpsCheck(true)
+  local ok = gpsCheck(true)
+  if ok and reason == "home" and state.homeFacing then
+    face(state.homeFacing)
+    saveState()
+  end
+  return ok
 end
 
 -- ---------- home setup ----------
@@ -541,7 +647,10 @@ local function emergencyReturn(reason)
   local ok = state.home and pcall(function() return goTo(state.home,"home") end)
   local at = false; if ok then gpsCheck(true); at=isAtHome() end
   if not at then markRogue(reason or "Emergency return failed") end
-  state.status="AT_HOME"; state.killMode=false; state.routePhase="idle"; saveState(); heartbeat(); report("AT_HOME",{emergency=true,pos=copy(state.pos)})
+  if state.homeFacing then
+    face(state.homeFacing)
+  end
+  state.status="AT_HOME"; state.killMode=false; state.routePhase="idle"; saveState(); heartbeat(); report("AT_HOME",{emergency=true,pos=copy(state.pos),facing=state.facing})
 end
 function handlePacket(id,msg)
   if not validPacket(msg) then return end
