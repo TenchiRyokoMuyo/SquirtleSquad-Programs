@@ -3,7 +3,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "controller"
-local VERSION = "v2.1-fullpass"
+local VERSION = "v2.1-origin-sequence"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MainController"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
@@ -424,19 +424,50 @@ local function agentIsOnline(a)
   return a and (now() - (a.lastSeen or 0)) <= AGENT_TIMEOUT * 1000
 end
 
-local function availableMiners()
+local function minerReferencePos(a)
+  -- Prefer the miner's saved home for startup ordering because the miner is
+  -- expected to begin jobs from home. Fall back to live position if needed.
+  return a and (a.home or a.pos)
+end
+
+local function minerDistanceToOrigin(a, jobOrigin)
+  if not jobOrigin then return 999999 end
+  local p = minerReferencePos(a)
+  if not p then return 999999 end
+  return distance(p, jobOrigin)
+end
+
+local function availableMiners(jobOrigin)
   local out = {}
   local ctrlPos = state.gps.x and {x=state.gps.x,y=state.gps.y,z=state.gps.z} or nil
   for id, a in pairs(state.agents) do
-    if a.role == "miner" and agentIsOnline(a) and a.status ~= "ROGUE" and a.status ~= "ASSIGNED" and a.status ~= "WORKING" and a.status ~= "RETURNING" then
+    if a.role == "miner"
+      and agentIsOnline(a)
+      and a.status ~= "ROGUE"
+      and a.status ~= "ASSIGNED"
+      and a.status ~= "MOVING_TO_ORIGIN"
+      and a.status ~= "AT_ORIGIN"
+      and a.status ~= "WORKING"
+      and a.status ~= "RETURNING"
+      and a.status ~= "RETURN_REQUESTED" then
       if a.homeValid and a.inventoryValid and a.gpsValid and a.atHome then
-        if not ctrlPos or not a.pos or distance(ctrlPos, a.pos) <= MINER_HOME_RANGE then
-          table.insert(out, { id=id, agent=a })
+        local ref = minerReferencePos(a)
+        if not ctrlPos or not ref or distance(ctrlPos, ref) <= MINER_HOME_RANGE then
+          table.insert(out, {
+            id = id,
+            agent = a,
+            originDistance = minerDistanceToOrigin(a, jobOrigin),
+          })
         end
       end
     end
   end
-  table.sort(out, function(a,b) return tostring(a.id) < tostring(b.id) end)
+  table.sort(out, function(a,b)
+    if a.originDistance ~= b.originDistance then
+      return a.originDistance < b.originDistance
+    end
+    return tostring(a.id) < tostring(b.id)
+  end)
   return out
 end
 
@@ -506,26 +537,63 @@ local function deleteJob(jobId)
   return true
 end
 
+local function jobWaitingForOrigin(job)
+  -- Startup traffic control: if a miner has been assigned but has not yet
+  -- reported AT_ORIGIN for this job, do not release another miner. This keeps
+  -- the home row from turning into a turtle traffic jam.
+  for _, task in ipairs(job.tasks or {}) do
+    if task.status == "IN_PROGRESS" and task.minerId and not task.originReached then
+      local a = state.agents[task.minerId]
+      if a and agentIsOnline(a) and a.status ~= "PROBLEM" and a.status ~= "ROGUE" then
+        return true, task
+      end
+    end
+  end
+  return false, nil
+end
+
+local function firstQueuedTask(job)
+  for _, task in ipairs(job.tasks or {}) do
+    if task.status == "QUEUED" then return task end
+  end
+  return nil
+end
+
 local function assignTasks()
   promoteQueuedJobs()
   cleanupJobLists()
   for _, jobId in ipairs(state.activeJobs) do
     local job = state.jobs[jobId]
     if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
-      local miners = availableMiners()
-      if #miners == 0 then return end
-      for _, task in ipairs(job.tasks or {}) do
-        if task.status == "QUEUED" and #miners > 0 then
-          local m = table.remove(miners, 1)
-          task.status = "IN_PROGRESS"
-          task.minerId = m.id
-          task.startedAt = now()
-          state.agents[m.id].status = "ASSIGNED"
-          state.agents[m.id].assignedTask = task.id
-          send(m.id, { type="TASK_ASSIGN", payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision } })
-          log("Assigned " .. task.id .. " to miner " .. tostring(m.id))
-        end
+      local waiting = jobWaitingForOrigin(job)
+      if waiting then
+        return
       end
+
+      local task = firstQueuedTask(job)
+      if not task then
+        saveState()
+        return
+      end
+
+      local miners = availableMiners(job.origin)
+      if #miners == 0 then return end
+
+      local m = miners[1]
+      task.status = "IN_PROGRESS"
+      task.minerId = m.id
+      task.startedAt = now()
+      task.originReached = false
+      task.originReachedAt = nil
+      state.agents[m.id].status = "ASSIGNED"
+      state.agents[m.id].assignedTask = task.id
+      send(m.id, {
+        type="TASK_ASSIGN",
+        payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision }
+      })
+      log("Assigned " .. task.id .. " to miner " .. tostring(m.id) .. " dist=" .. string.format("%.1f", m.originDistance or 0))
+      saveState()
+      return
     end
   end
   saveState()
@@ -648,7 +716,24 @@ local function handlePacket(id, p)
   elseif p.type == "AT_HOME" then
     if state.agents[id] then state.agents[id].atHome = true; state.agents[id].status = "AT_HOME" end
   elseif p.type == "AT_ORIGIN" then
-    if state.agents[id] then state.agents[id].status = "AT_ORIGIN" end
+    if state.agents[id] then
+      state.agents[id].status = "AT_ORIGIN"
+      state.agents[id].atHome = false
+      if p.payload and p.payload.pos then state.agents[id].pos = p.payload.pos end
+    end
+    local taskId = p.payload and p.payload.taskId or (state.agents[id] and state.agents[id].assignedTask)
+    for _, job in pairs(state.jobs) do
+      for _, task in ipairs(job.tasks or {}) do
+        if task.id == taskId and task.minerId == id and task.status == "IN_PROGRESS" then
+          task.originReached = true
+          task.originReachedAt = now()
+          log("Miner " .. tostring(id) .. " reached origin for " .. tostring(task.id))
+          saveState()
+          return
+        end
+      end
+    end
+    saveState()
   end
 end
 
