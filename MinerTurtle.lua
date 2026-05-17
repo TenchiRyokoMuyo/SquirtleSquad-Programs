@@ -89,6 +89,23 @@ local function turnRight() turtle.turnRight(); state.facing=ORDER[(faceIndex(sta
 local function turnAround() turnRight(); turnRight() end
 local function face(f) while state.facing~=f do local ci,ti=faceIndex(state.facing),faceIndex(f); if ((ti-ci)%4)==1 then turnRight() elseif ((ci-ti)%4)==1 then turnLeft() else turnRight() end end end
 local function targetForDir(dir) if dir=="up" then return {x=state.pos.x,y=state.pos.y+1,z=state.pos.z} end if dir=="down" then return {x=state.pos.x,y=state.pos.y-1,z=state.pos.z} end local d=DIRS[state.facing]; return {x=state.pos.x+d.dx,y=state.pos.y,z=state.pos.z+d.dz} end
+local function facingFromDelta(a,b)
+  if not a or not b then return nil end
+  local dx=(b.x or 0)-(a.x or 0)
+  local dz=(b.z or 0)-(a.z or 0)
+  if dx==1 and dz==0 then return "east" end
+  if dx==-1 and dz==0 then return "west" end
+  if dx==0 and dz==1 then return "south" end
+  if dx==0 and dz==-1 then return "north" end
+  return nil
+end
+local function oppositeFacing(f)
+  if f=="north" then return "south" end
+  if f=="south" then return "north" end
+  if f=="east" then return "west" end
+  if f=="west" then return "east" end
+  return f
+end
 local function inverseMove(move) if move=="forward" then return "back" elseif move=="up" then return "down" elseif move=="down" then return "up" end return nil end
 
 -- ---------- shape/bounds ----------
@@ -260,47 +277,52 @@ local function routeForwardStep(reason)
   if shouldInterruptMovement() then return false,"interrupted",targetForDir("forward") end
   if not gpsCheck(false) then return false,"gps",targetForDir("forward") end
 
-  local target = targetForDir("forward")
-  local ok, why = allowedTarget(target, reason)
-  if not ok then return false, why or "not_allowed", target end
+  local before = copy(state.pos)
+  local intended = targetForDir("forward")
+  local ok, why = allowedTarget(intended, reason)
+  if not ok then return false, why or "not_allowed", intended end
 
   for attempt=1,6 do
     local n = blockName("forward")
-
     if n then
       if isProtectedName(n) or (isTorchName(n) and state.job and state.job.torchMode=="ignored") then
-        return false,"blocked_protected",target,n
+        return false,"blocked_protected",intended,n
       end
       if isTorchName(n) and state.job and state.job.torchMode=="replaced" and state.task and state.task.passIndex>1 then
-        return false,"blocked_preserved_torch",target,n
+        return false,"blocked_preserved_torch",intended,n
       end
       if n=="minecraft:lava" or n=="minecraft:flowing_lava" then
-        if not handleLava("forward", target) then return false,"lava",target,n end
+        if not handleLava("forward", intended) then return false,"lava",intended,n end
       else
-        -- Corridor routing may dig ordinary blocks, but never protected blocks.
-        if not turtle.dig() then
-          return false,"dig_failed",target,n
-        end
+        if not turtle.dig() then return false,"dig_failed",intended,n end
         state.stats.mined=(state.stats.mined or 0)+1
       end
     end
 
     if turtle.forward() then
-      state.pos=target
-      state.lastSafePos=copy(target)
+      local actual = locate(0.75) or intended
+      local inferred = facingFromDelta(before, actual)
+      if inferred then state.facing = inferred end
+      local okActual, whyActual = allowedTarget(actual, reason)
+      if not okActual then
+        -- We moved, but GPS says the physical move was not legal. Undo if possible.
+        turtle.back()
+        state.pos = before
+        saveState()
+        return false, whyActual or "actual_target_not_allowed", actual
+      end
+      state.pos=actual
+      state.lastSafePos=copy(actual)
       state.movesSinceGps=(state.movesSinceGps or 0)+1
       saveState()
-      if not gpsCheck(false) then return false,"gps_after_move",target end
-      return true,nil,target
+      if not gpsCheck(false) then return false,"gps_after_move",actual end
+      return true,nil,actual
     end
 
-    -- If inspect still sees nothing, this is usually a transient collision
-    -- such as another turtle/player/entity.  Wait briefly before deciding the
-    -- coordinate should be treated as occupied and replanned around.
     sleep(0.25)
   end
 
-  return false,"move_failed_transient",target
+  return false,"move_failed_transient",intended
 end
 
 local returnToOrigin
@@ -610,53 +632,72 @@ local function undockFromHomeForOrigin(target)
   state.status = "UNDOCKING"
   saveState(); heartbeat()
 
-  local dirs = {"north", "east", "south", "west"}
-  table.sort(dirs, function(a,b)
-    local da, db = DIRS[a], DIRS[b]
-    local pa = {x=state.pos.x+da.dx, y=state.pos.y, z=state.pos.z+da.dz}
-    local pb = {x=state.pos.x+db.dx, y=state.pos.y, z=state.pos.z+db.dz}
-    local oa = target and (math.abs(pa.x-target.x)+math.abs(pa.z-target.z)) or 0
-    local ob = target and (math.abs(pb.x-target.x)+math.abs(pb.z-target.z)) or 0
-    return oa < ob
-  end)
+  -- Do not depend on saved facing here. If a turtle was picked up, rotated,
+  -- restored from state, or desynced by a failed move, the saved facing can be
+  -- wrong.  Try physical forward/back moves while rotating through all four
+  -- physical directions, then infer facing from GPS after the first successful
+  -- horizontal move. This is intentionally non-destructive: it never digs while
+  -- leaving the home rack.
+  local startPos = locate(1) or copy(state.pos)
+  state.pos = copy(startPos)
 
-  local tried = {}
-  for _,dir in ipairs(dirs) do
-    if shouldInterruptMovement() then return false end
-    face(dir)
-    local stepTarget = targetForDir("forward")
-    local k = keyXZ(stepTarget.x, stepTarget.z)
-    tried[k] = true
-
-    local okAllowed = allowedTarget(stepTarget, "origin")
-    if okAllowed then
-      local moved, why, blockedTarget, block = routeForwardStep("origin")
-      if moved then
-        report("UNDOCKED", {pos=copy(state.pos), dir=dir, taskId=state.task and state.task.id})
-        return true
-      end
-      report("UNDOCK_BLOCKED", {dir=dir, reason=why, block=block, target=copy(blockedTarget or stepTarget), taskId=state.task and state.task.id})
+  local function acceptUndockMove(actual, movedBackward)
+    if not actual then return false,"no_gps_after_undock" end
+    local dx = math.abs((actual.x or 0) - (state.home.x or 0))
+    local dz = math.abs((actual.z or 0) - (state.home.z or 0))
+    if actual.y ~= state.home.y or dx > 6 or dz > 6 then
+      return false,"undock_left_home_escape_zone"
     end
+    local moveFacing = facingFromDelta(startPos, actual)
+    if moveFacing then
+      state.facing = movedBackward and oppositeFacing(moveFacing) or moveFacing
+    end
+    state.pos = actual
+    state.lastSafePos = copy(actual)
+    saveState()
+    report("UNDOCKED", {pos=copy(state.pos), inferredFacing=state.facing, backward=movedBackward, taskId=state.task and state.task.id})
+    return true
   end
 
-  -- If every preferred direction failed, try all directions once more. This
-  -- catches cases where a transient collision cleared while we were rotating.
-  for _,dir in ipairs(dirs) do
+  for turn=1,4 do
     if shouldInterruptMovement() then return false end
-    face(dir)
-    local stepTarget = targetForDir("forward")
-    local okAllowed = allowedTarget(stepTarget, "origin")
-    if okAllowed then
-      local moved, why, blockedTarget, block = routeForwardStep("origin")
-      if moved then
-        report("UNDOCKED", {pos=copy(state.pos), dir=dir, retry=true, taskId=state.task and state.task.id})
-        return true
+
+    local n = blockName("forward")
+    if not n or not isProtectedName(n) then
+      if turtle.forward() then
+        local actual = locate(1)
+        local ok,why = acceptUndockMove(actual, false)
+        if ok then return true end
+        turtle.back()
+        state.pos = copy(startPos)
+        report("UNDOCK_REJECTED", {reason=why, pos=actual})
+      else
+        report("UNDOCK_FORWARD_FAILED", {facing=state.facing, block=n})
       end
-      report("UNDOCK_BLOCKED", {dir=dir, reason=why, block=block, target=copy(blockedTarget or stepTarget), retry=true, taskId=state.task and state.task.id})
+    else
+      report("UNDOCK_FORWARD_BLOCKED", {facing=state.facing, block=n})
     end
+
+    -- Try backing out too. This is important for rack layouts where the
+    -- turtle's saved facing points into another turtle/chest but the aisle is
+    -- behind it. turtle.back() cannot inspect first, so verify by GPS after.
+    if turtle.back() then
+      local actual = locate(1)
+      local ok,why = acceptUndockMove(actual, true)
+      if ok then return true end
+      turtle.forward()
+      state.pos = copy(startPos)
+      report("UNDOCK_REJECTED", {reason=why, pos=actual, backward=true})
+    else
+      report("UNDOCK_BACK_FAILED", {facing=state.facing})
+    end
+
+    turnRight()
   end
 
-  return reportProblem("Could not undock from home rack", {home=copy(state.home), target=copy(target)})
+  state.pos = copy(startPos)
+  saveState()
+  return reportProblem("Could not undock from home rack", {home=copy(state.home), target=copy(target), note="No physical forward/back move succeeded from home"})
 end
 
 function goTo(p, reason)
