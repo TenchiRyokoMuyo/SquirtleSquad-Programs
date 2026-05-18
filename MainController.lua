@@ -592,6 +592,19 @@ local function firstQueuedTask(job)
   return nil
 end
 
+
+local function minerHasActiveTask(minerId)
+  if not minerId then return false end
+  for _, job in pairs(state.jobs or {}) do
+    for _, task in ipairs(job.tasks or {}) do
+      if task.minerId == minerId and task.status == "IN_PROGRESS" then
+        return true
+      end
+    end
+  end
+  return false
+end
+
 local function assignTasks()
   promoteQueuedJobs()
   cleanupJobLists()
