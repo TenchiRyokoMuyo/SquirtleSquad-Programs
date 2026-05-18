@@ -316,6 +316,13 @@ local function expandBounds(b, n)
   return { minX=b.minX-n, maxX=b.maxX+n, minY=b.minY-n, maxY=b.maxY+n, minZ=b.minZ-n, maxZ=b.maxZ+n }
 end
 
+local function inBox(b, p)
+  return b and p
+    and p.x >= b.minX and p.x <= b.maxX
+    and p.y >= b.minY and p.y <= b.maxY
+    and p.z >= b.minZ and p.z <= b.maxZ
+end
+
 local function shapeBounds(job)
   local h = math.max(1, tonumber(job.layerHeight) or 1)
   if job.shape == "cuboid_center" then
