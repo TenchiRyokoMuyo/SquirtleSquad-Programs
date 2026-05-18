@@ -3,7 +3,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "controller"
-local VERSION = "v2.1-field-reassign-queuefix"
+local VERSION = "v2.1-field-reassign"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MainController"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
@@ -595,41 +595,49 @@ end
 local function assignTasks()
   promoteQueuedJobs()
   cleanupJobLists()
+
+  -- The transit queue now controls home <-> origin traffic, so the controller
+  -- should assign every currently available miner to a queued task. Miners that
+  -- need to leave home will line up through TRANSIT_LOCK_REQUEST instead of
+  -- all physically moving at once.
+  local changed = false
+
   for _, jobId in ipairs(state.activeJobs) do
     local job = state.jobs[jobId]
     if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
-      local waiting = jobWaitingForOrigin(job)
-      if waiting then
-        return
-      end
-
-      local task = firstQueuedTask(job)
-      if not task then
-        saveState()
-        return
-      end
-
       local miners = availableMiners(job)
-      if #miners == 0 then return end
+      local minerIndex = 1
 
-      local m = miners[1]
-      task.status = "IN_PROGRESS"
-      task.minerId = m.id
-      task.startedAt = now()
-      task.originReached = false
-      task.originReachedAt = nil
-      state.agents[m.id].status = "ASSIGNED"
-      state.agents[m.id].assignedTask = task.id
-      send(m.id, {
-        type="TASK_ASSIGN",
-        payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision }
-      })
-      log("Assigned " .. task.id .. " to miner " .. tostring(m.id) .. " dist=" .. string.format("%.1f", m.originDistance or 0))
-      saveState()
-      return
+      while minerIndex <= #miners do
+        local task = firstQueuedTask(job)
+        if not task then break end
+
+        local m = miners[minerIndex]
+        minerIndex = minerIndex + 1
+
+        if m and m.id and state.agents[m.id] then
+          task.status = "IN_PROGRESS"
+          task.minerId = m.id
+          task.startedAt = now()
+          task.originReached = false
+          task.originReachedAt = nil
+
+          state.agents[m.id].status = "ASSIGNED"
+          state.agents[m.id].assignedTask = task.id
+
+          send(m.id, {
+            type="TASK_ASSIGN",
+            payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision }
+          })
+
+          log("Assigned " .. task.id .. " to miner " .. tostring(m.id) .. " dist=" .. string.format("%.1f", m.originDistance or 0))
+          changed = true
+        end
+      end
     end
   end
-  saveState()
+
+  if changed then saveState() else saveState() end
 end
 
 local function checkJobCompletion(job)
