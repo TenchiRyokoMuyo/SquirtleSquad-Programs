@@ -6,7 +6,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "miner"
-local VERSION = "v2.1-fullpass-refuel-origin-horizontal"
+local VERSION = "v2.1-fullpass-transit-waitfix"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MinerTurtle"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -15,7 +15,7 @@ local HEARTBEAT_INTERVAL = 5
 local GPS_CHECK_MOVES = 8
 local CONTROLLER_TIMEOUT = 10
 local ORIGIN_LOCK_TIMEOUT = 60
-local TRANSIT_LOCK_TIMEOUT = 600
+local TRANSIT_LOCK_TIMEOUT = 3600
 local BYPASS_LIMIT = 5
 
 local VALID_FUEL = { ["minecraft:coal"] = true, ["minecraft:charcoal"] = true }
@@ -508,9 +508,20 @@ claimTransitLock = function(purpose)
   state.transitLockId = lockId
   state.status = purpose == "to_home" and "QUEUED_TO_HOME" or "QUEUED_TO_ORIGIN"
   saveState(); heartbeat()
-  send(state.controllerId,{type="TRANSIT_LOCK_REQUEST",payload={lockId=lockId,purpose=purpose or "transit",jobId=state.job and state.job.id,taskId=state.task and state.task.id,pos=copy(state.pos)}})
-  local deadline=os.clock()+TRANSIT_LOCK_TIMEOUT
-  while os.clock()<deadline do
+
+  local lastRequest = 0
+  local waitStarted = os.clock()
+
+  while true do
+    if (not state.controllerId) then return false,"no controller" end
+
+    -- Re-broadcast the request periodically. This handles a dropped rednet packet
+    -- without making the miner fail the task while it is simply waiting its turn.
+    if os.clock() - lastRequest > 5 then
+      send(state.controllerId,{type="TRANSIT_LOCK_REQUEST",payload={lockId=lockId,purpose=purpose or "transit",jobId=state.job and state.job.id,taskId=state.task and state.task.id,pos=copy(state.pos),waitStarted=waitStarted}})
+      lastRequest = os.clock()
+    end
+
     local id,msg=rednet.receive(PROTOCOL,1)
     if id and validPacket(msg) then
       handlePacket(id,msg)
@@ -524,10 +535,17 @@ claimTransitLock = function(purpose)
         saveState(); heartbeat()
       end
     end
+
+    if returnRequested and purpose ~= "to_home" then return false,"return requested" end
     if paused and purpose ~= "to_home" then return false,"paused" end
-    sleep(0.1)
+
+    -- Safety: if something is badly wrong for a very long time, report a
+    -- controller/queue problem instead of an origin pathing problem. This limit
+    -- is intentionally high so normal multi-miner queues do not problem out.
+    if os.clock() - waitStarted > TRANSIT_LOCK_TIMEOUT then
+      return false,"transit lock wait exceeded "..tostring(TRANSIT_LOCK_TIMEOUT).."s"
+    end
   end
-  return false,"transit lock timeout"
 end
 
 releaseTransitLock = function()

@@ -927,7 +927,7 @@ local function handleTransitLockRequest(id, p)
   state.transitLock = state.transitLock or { holder = nil, queue = {} }
   local pl = p.payload or {}
   local holder = state.transitLock.holder
-  if holder and ((now() - (holder.startedAt or 0)) > 180000 or not state.agents[holder.minerId] or not agentIsOnline(state.agents[holder.minerId])) then
+  if holder and ((now() - (holder.startedAt or 0)) > 900000 or not state.agents[holder.minerId] or not agentIsOnline(state.agents[holder.minerId])) then
     log("Transit lock expired from " .. tostring(holder.minerId))
     state.transitLock.holder = nil
     holder = nil
