@@ -592,7 +592,6 @@ local function firstQueuedTask(job)
   return nil
 end
 
-
 local function minerHasActiveTask(minerId)
   if not minerId then return false end
   for _, job in pairs(state.jobs or {}) do
@@ -613,6 +612,7 @@ local function assignTasks()
 
   for _, jobId in ipairs(state.activeJobs) do
     local job = state.jobs[jobId]
+
     if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
       local miners = availableMiners(job)
       local minerIndex = 1
@@ -672,6 +672,7 @@ local function assignTasks()
 
   saveState()
 end
+
 local function checkJobCompletion(job)
   local anyQueued, anyProgress, anyProblem = false, false, false
   for _, t in ipairs(job.tasks or {}) do
