@@ -881,6 +881,7 @@ local function handlePacket(id, p)
           task.originReachedAt = now()
           log("Miner " .. tostring(id) .. " reached origin for " .. tostring(task.id))
           saveState()
+          assignTasks()
           return
         end
       end
