@@ -443,18 +443,6 @@ local function minerIsInsideJob(job, a)
   return inBox(b, a.pos)
 end
 
-
-local function minerHasActiveTask(minerId)
-  for _, job in pairs(state.jobs or {}) do
-    for _, task in ipairs(job.tasks or {}) do
-      if task.minerId == minerId and task.status == "IN_PROGRESS" then
-        return true, task, job
-      end
-    end
-  end
-  return false, nil, nil
-end
-
 local function minerReferencePos(a, job)
   -- For initial deployment, prefer home so the first turtle nearest the job
   -- origin leaves first. Once a turtle is already in the job area, prefer its
@@ -477,7 +465,6 @@ local function availableMiners(job)
   for id, a in pairs(state.agents) do
     if a.role == "miner"
       and agentIsOnline(a)
-      and not minerHasActiveTask(id)
       and a.status ~= "ROGUE"
       and a.status ~= "ASSIGNED"
       and a.status ~= "MOVING_TO_ORIGIN"
@@ -614,37 +601,64 @@ local function assignTasks()
   for _, jobId in ipairs(state.activeJobs) do
     local job = state.jobs[jobId]
     if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
-      while true do
-        local task = firstQueuedTask(job)
-        if not task then break end
+      local miners = availableMiners(job)
+      local minerIndex = 1
+      local usedMiners = {}
 
-        local miners = availableMiners(job)
-        if #miners == 0 then break end
+      for _, task in ipairs(job.tasks or {}) do
+        if task.status == "QUEUED" then
+          local chosen = nil
 
-        local m = miners[1]
-        task.status = "IN_PROGRESS"
-        task.minerId = m.id
-        task.startedAt = now()
-        task.originReached = false
-        task.originReachedAt = nil
+          while minerIndex <= #miners do
+            local candidate = miners[minerIndex]
+            minerIndex = minerIndex + 1
 
-        state.agents[m.id].status = "ASSIGNED"
-        state.agents[m.id].assignedTask = task.id
+            if candidate
+              and candidate.id
+              and not usedMiners[candidate.id]
+              and not minerHasActiveTask(candidate.id)
+              and state.agents[candidate.id]
+            then
+              chosen = candidate
+              break
+            end
+          end
 
-        send(m.id, {
-          type="TASK_ASSIGN",
-          payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision }
-        })
+          if not chosen then
+            break
+          end
 
-        log("Assigned " .. task.id .. " to miner " .. tostring(m.id) .. " dist=" .. string.format("%.1f", m.originDistance or 0))
-        changed = true
+          usedMiners[chosen.id] = true
+
+          task.status = "IN_PROGRESS"
+          task.minerId = chosen.id
+          task.startedAt = now()
+          task.originReached = false
+          task.originReachedAt = nil
+
+          state.agents[chosen.id].status = "ASSIGNED"
+          state.agents[chosen.id].assignedTask = task.id
+
+          send(chosen.id, {
+            type = "TASK_ASSIGN",
+            payload = {
+              job = compactJob(job),
+              task = copy(task),
+              protectedRevision = state.protected.revision
+            }
+          })
+
+          log("Assigned " .. tostring(task.id) .. " to miner " .. tostring(chosen.id) ..
+              " dist=" .. string.format("%.1f", chosen.originDistance or 0))
+
+          changed = true
+        end
       end
     end
   end
 
   saveState()
 end
-
 local function checkJobCompletion(job)
   local anyQueued, anyProgress, anyProblem = false, false, false
   for _, t in ipairs(job.tasks or {}) do
@@ -894,6 +908,7 @@ local function handlePacket(id, p)
           task.originReachedAt = now()
           log("Miner " .. tostring(id) .. " reached origin for " .. tostring(task.id))
           saveState()
+          assignTasks()
           return
         end
       end
