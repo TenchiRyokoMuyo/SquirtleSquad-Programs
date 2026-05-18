@@ -6,7 +6,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "miner"
-local VERSION = "v2.1-fullpass-gps-racefix"
+local VERSION = "v2.2-task-recovery"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MinerTurtle"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -239,6 +239,34 @@ local function serviceInventory()
   return state.inventoryValid
 end
 local function needsService() if not validFuelSlot() then return true,"fuel" end if not hasFiller() then return true,"filler" end if state.job and state.job.torchMode=="replaced" and not validTorchSlot(true) then return true,"torches" end local full=true; for s=WORK_SLOTS_MIN,WORK_SLOTS_MAX do if turtle.getItemCount(s)==0 then full=false break end end if full then return true,"inventory full" end return false,nil end
+local function validateLocalInventory()
+  state.inventoryValid = validFuelSlot() and hasFiller() and validTorchSlot(state.job and state.job.torchMode=="replaced")
+  saveState()
+  return state.inventoryValid
+end
+local function hasRecoverableTask()
+  return (not state.rogue) and type(state.job)=="table" and type(state.task)=="table" and type(state.task.id)=="string"
+end
+local function clearRecoveredProgress()
+  state.progress = nil
+  saveState()
+end
+local function saveProgress(x,z)
+  if state.task and state.task.id then
+    state.progress = { taskId = state.task.id, x = x, z = z, y = state.task.travelY, updated = now() }
+    saveState()
+  end
+end
+local function getProgressStart(bounds)
+  if state.progress and state.task and state.progress.taskId == state.task.id and bounds then
+    local z = tonumber(state.progress.z)
+    local x = tonumber(state.progress.x)
+    if z and x and z >= bounds.minZ and z <= bounds.maxZ and x >= bounds.minX and x <= bounds.maxX then
+      return x,z
+    end
+  end
+  return bounds.minX,bounds.minZ
+end
 local function fuelIfNeeded() if turtle.getFuelLevel and turtle.getFuelLevel()~="unlimited" and turtle.getFuelLevel()<100 then local n,c=itemName(FUEL_SLOT); if VALID_FUEL[n] and c>0 then turtle.select(FUEL_SLOT); turtle.refuel(1) end end end
 
 local function ensureFuelForMove()
@@ -706,15 +734,91 @@ end
 local function workTask()
   if returnRequested then return false end
   if not state.job or not state.task then return false end
-  if (state.protectedRevision or 0) < (state.assignment and state.assignment.protectedRevision or 0) then report("PROTECTED_REQUEST",{}); sleep(1) end
-  state.status="CLAIMING_ORIGIN"; heartbeat(); local ok,why=claimOriginLock(); if not ok then return reportProblem("Could not claim origin movement lock: "..tostring(why)) end
-  if not returnToOrigin() then releaseOriginLock(); return reportProblem("Could not reach origin") end
+
+  validateLocalInventory()
+  if (state.protectedRevision or 0) < (state.assignment and state.assignment.protectedRevision or 0) then
+    report("PROTECTED_REQUEST",{})
+    sleep(1)
+  end
+
+  state.status="CLAIMING_ORIGIN"
+  heartbeat()
+  local ok,why=claimOriginLock()
+  if not ok then return reportProblem("Could not claim origin movement lock: "..tostring(why)) end
+  if not returnToOrigin() then
+    releaseOriginLock()
+    return reportProblem("Could not reach origin")
+  end
   releaseOriginLock()
-  state.status="WORKING"; state.routePhase="work"; saveState(); heartbeat()
+
+  state.status="WORKING"
+  state.routePhase="work"
+  saveState(); heartbeat()
+
   local b=state.task.bounds
-  for z=b.minZ,b.maxZ do if shouldInterruptMovement() then return false end; local xStart,xEnd,xStep=b.minX,b.maxX,1; if (z-b.minZ)%2==1 then xStart,xEnd,xStep=b.maxX,b.minX,-1 end; local x=xStart; while (xStep==1 and x<=xEnd) or (xStep==-1 and x>=xEnd) do if shouldInterruptMovement() then return false end; fuelIfNeeded(); local svc,whySvc=needsService(); if svc then local resume={x=x,y=state.task.travelY,z=z}; if not returnToOrigin() then return false end; if not serviceInventory() then return reportProblem("Supplies unavailable: "..tostring(whySvc)) end; if not returnToOrigin() then return false end; state.routePhase="work"; if not goTo(resume,"work") then return false end else if not mineColumnAt(x,z) then return false end; x=x+xStep end end end
-  state.routePhase="to_origin"; returnToOrigin(); state.routePhase="to_home"; serviceInventory(); state.routePhase="idle"
-  local taskId=state.task.id; state.status="IDLE"; state.assignment=nil; state.task=nil; state.job=nil; paused=false; saveState(); report("TASK_COMPLETE",{taskId=taskId,pos=copy(state.pos)}); return true
+  local startX,startZ = getProgressStart(b)
+  local started = false
+
+  for z=b.minZ,b.maxZ do
+    if shouldInterruptMovement() then return false end
+
+    local xStart,xEnd,xStep=b.minX,b.maxX,1
+    if (z-b.minZ)%2==1 then xStart,xEnd,xStep=b.maxX,b.minX,-1 end
+
+    local x=xStart
+    if not started then
+      if z < startZ then
+        x = xEnd + xStep -- skip rows before saved progress
+      elseif z == startZ then
+        x = startX
+        -- Clamp to this row direction. If the saved X is somehow off this row,
+        -- fall back to the row start instead of failing recovery.
+        if xStep == 1 then
+          if x < b.minX or x > b.maxX then x = xStart end
+        else
+          if x < b.minX or x > b.maxX then x = xStart end
+        end
+        started = true
+      else
+        started = true
+      end
+    end
+
+    while (xStep==1 and x<=xEnd) or (xStep==-1 and x>=xEnd) do
+      if shouldInterruptMovement() then return false end
+      saveProgress(x,z)
+      fuelIfNeeded()
+      local svc,whySvc=needsService()
+      if svc then
+        local resume={x=x,y=state.task.travelY,z=z}
+        if not returnToOrigin() then return false end
+        if not serviceInventory() then return reportProblem("Supplies unavailable: "..tostring(whySvc)) end
+        if not returnToOrigin() then return false end
+        state.routePhase="work"
+        if not goTo(resume,"work") then return false end
+      else
+        if not mineColumnAt(x,z) then return false end
+        x=x+xStep
+      end
+    end
+  end
+
+  state.routePhase="to_origin"
+  returnToOrigin()
+  state.routePhase="to_home"
+  serviceInventory()
+  state.routePhase="idle"
+
+  local taskId=state.task.id
+  state.status="IDLE"
+  state.assignment=nil
+  state.task=nil
+  state.job=nil
+  state.progress=nil
+  paused=false
+  saveState()
+  report("TASK_COMPLETE",{taskId=taskId,pos=copy(state.pos)})
+  return true
 end
 
 -- ---------- emergency / command handling ----------
@@ -757,11 +861,95 @@ local function displayLoop() while running do header("Status"); print("ID: "..os
 
 -- ---------- boot ----------
 local function boot()
-  ensureDir(); loadState(); header("Boot"); if not openModem() then print("No modem found."); return false end
-  local ok,why=gpsQuorum(); if not ok then print("GPS invalid: "..tostring(why)); sleep(2); return false end
-  if state.rogue then if state.home and samePos(state.pos,state.home) then state.rogue=false; state.status="AT_HOME"; pcall(os.setComputerLabel,"Miner-"..os.getComputerID()); saveState() else header("ROGUE LOCK"); print("This turtle was marked Rogue."); print("Saved home:"); writeCoord(state.home); print(""); print("Current GPS:"); writeCoord(state.pos); print(""); print("Place it back at saved home and reboot."); return false end end
-  if not state.homeValid or not state.home then if not setupHome() then return false end else state.atHome=samePos(state.pos,state.home); if not state.atHome then header("Not At Home"); print("Saved home:"); writeCoord(state.home); print(""); print("Current:"); writeCoord(state.pos); print(""); print("Move turtle back home or clear data."); return false end end
-  if not serviceInventory() then header("Inventory"); print("Could not validate fuel/filler/torches from upper chest."); sleep(2) end
-  state.status=state.inventoryValid and "AT_HOME" or "NEEDS_SUPPLIES"; saveState(); register(); return true
+  ensureDir()
+  loadState()
+  header("Boot")
+
+  if not openModem() then
+    print("No modem found.")
+    return false
+  end
+
+  -- Locks are controller-side runtime leases. After an unload/reboot, never assume
+  -- an old local lock is still valid; request fresh locks when movement resumes.
+  state.originLockHeld = false
+  state.transitLockHeld = false
+  state.transitLockId = nil
+  state.routePhase = "idle"
+  returnRequested = false
+  returnReason = nil
+
+  local ok,why=gpsQuorum()
+  if not ok then
+    print("GPS invalid: "..tostring(why))
+    sleep(2)
+    return false
+  end
+
+  if state.rogue then
+    if state.home and samePos(state.pos,state.home) then
+      state.rogue=false
+      state.status="AT_HOME"
+      pcall(os.setComputerLabel,"Miner-"..os.getComputerID())
+      saveState()
+    else
+      header("ROGUE LOCK")
+      print("This turtle was marked Rogue.")
+      print("Saved home:")
+      writeCoord(state.home); print("")
+      print("Current GPS:")
+      writeCoord(state.pos); print("")
+      print("Place it back at saved home and reboot.")
+      return false
+    end
+  end
+
+  if not state.homeValid or not state.home then
+    if not setupHome() then return false end
+  else
+    state.atHome=samePos(state.pos,state.home)
+  end
+
+  -- Recovery mode: if the turtle was unloaded while assigned to a task, do not
+  -- force it to be physically at home. Keep the saved job/task/progress and let
+  -- workLoop call workTask(), which will re-claim locks, return to origin, and
+  -- continue from the last saved column.
+  if hasRecoverableTask() and not state.atHome then
+    validateLocalInventory()
+    state.status="RECOVERING_TASK"
+    state.lastProblem=nil
+    saveState()
+    register()
+    report("TASK_RECOVERY",{taskId=state.task.id,jobId=state.job and state.job.id,pos=copy(state.pos),progress=copy(state.progress)})
+    return true
+  end
+
+  if state.home and not state.atHome then
+    header("Not At Home")
+    print("Saved home:")
+    writeCoord(state.home); print("")
+    print("Current:")
+    writeCoord(state.pos); print("")
+    print("Move turtle back home or clear data.")
+    return false
+  end
+
+  if not serviceInventory() then
+    header("Inventory")
+    print("Could not validate fuel/filler/torches from upper chest.")
+    sleep(2)
+  end
+
+  -- If a turtle rebooted at home while still holding an assigned task, resume it.
+  -- Otherwise it may report AT_HOME and wait for a new assignment as usual.
+  if hasRecoverableTask() then
+    validateLocalInventory()
+    state.status="RECOVERING_TASK"
+  else
+    state.status=state.inventoryValid and "AT_HOME" or "NEEDS_SUPPLIES"
+  end
+  saveState()
+  register()
+  return true
 end
 if boot() then parallel.waitForAny(networkLoop,heartbeatLoop,workLoop,displayLoop) end
