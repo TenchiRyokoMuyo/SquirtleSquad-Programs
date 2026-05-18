@@ -267,16 +267,19 @@ local function rollbackPath(rollback)
   for i=#rollback,1,-1 do local a=rollback[i]; if a=="L" then turnLeft() elseif a=="R" then turnRight() elseif a=="U" then rawMove("up","rollback",false,false) elseif a=="D" then rawMove("down","rollback",false,false) elseif a=="B" then if turtleBack() then local d=DIRS[state.facing]; state.pos={x=state.pos.x-d.dx,y=state.pos.y,z=state.pos.z-d.dz}; saveState() else return false end end end
   return gpsCheck(true)
 end
-local function tryBypassPath(actions, label)
+local function tryBypassPath(actions, label, routeReason)
   local start=copy(state.pos); local sf=state.facing; local rb={}; state.status="BYPASS_"..label; saveState()
-  for _,a in ipairs(actions) do if not runAction(a,rb,"bypass") then rollbackPath(rb); face(sf); if not samePos(state.pos,start) then gpsCheck(true) end; return false end end
+  routeReason = routeReason or "bypass"
+  for _,a in ipairs(actions) do if not runAction(a,rb,routeReason) then rollbackPath(rb); face(sf); if not samePos(state.pos,start) then gpsCheck(true) end; return false end end
   if not gpsCheck(true) then rollbackPath(rb); face(sf); return false end
   state.stats.bypasses=(state.stats.bypasses or 0)+1; state.status="WORKING"; saveState(); return true
 end
 function attemptBypassProtected(name, reason)
   if shouldInterruptMovement() then return false end
-  report("BYPASS_ATTEMPT",{name=name,pos=copy(state.pos),taskId=state.task and state.task.id})
+  report("BYPASS_ATTEMPT",{name=name,pos=copy(state.pos),taskId=state.task and state.task.id,routeReason=reason,routePhase=state.routePhase})
   local h=state.job and state.job.layerHeight or 1
+  local transitBypass = (reason=="origin" or reason=="home" or state.routePhase=="to_origin" or state.routePhase=="to_home")
+  local routeReason = transitBypass and ((state.routePhase=="to_home" or reason=="home") and "home" or "origin") or "bypass"
 
   local function repeatAction(action, count)
     local t={}
@@ -291,50 +294,62 @@ function attemptBypassProtected(name, reason)
     return out
   end
 
-  -- Height 2: try under-routes with increasing forward clearance.
-  -- The turtle goes down, moves forward far enough to clear the protected block,
-  -- then comes back up only after it is past the obstruction.
-  if h==2 then
-    for forwardDist=2,BYPASS_LIMIT do
-      if shouldInterruptMovement() then return false end
-      if tryBypassPath(join({"D"},repeatAction("F",forwardDist),{"U"}),"UNDER_"..forwardDist) then return true end
+  local function trySideBypass()
+    for sideDist=1,BYPASS_LIMIT do
+      for forwardDist=2,BYPASS_LIMIT do
+        if shouldInterruptMovement() then return false end
+        local leftPath = join({"L"},repeatAction("F",sideDist),{"R"},repeatAction("F",forwardDist),{"R"},repeatAction("F",sideDist),{"L"})
+        if tryBypassPath(leftPath,"LEFT_"..sideDist.."_"..forwardDist,routeReason) then return true end
+        if shouldInterruptMovement() then return false end
+        local rightPath = join({"R"},repeatAction("F",sideDist),{"L"},repeatAction("F",forwardDist),{"L"},repeatAction("F",sideDist),{"R"})
+        if tryBypassPath(rightPath,"RIGHT_"..sideDist.."_"..forwardDist,routeReason) then return true end
+      end
     end
+    return false
   end
 
-  -- Height >=3: try over-routes with increasing forward clearance.
-  -- It must move over AND past the protected block before descending.
-  if h>=3 then
-    for forwardDist=2,BYPASS_LIMIT do
-      if shouldInterruptMovement() then return false end
-      if tryBypassPath(join({"U"},repeatAction("F",forwardDist),{"D"}),"OVER_"..forwardDist) then return true end
+  -- During home/origin transit, bypass within the permitted transit corridor.
+  -- Do not try vertical over-routes first; the turtle is docked under its fuel chest,
+  -- so going up tends to hit the chest and trap the miner behind the rack.
+  if transitBypass then
+    if trySideBypass() then return true end
+  else
+    -- Height 2: try under-routes with increasing forward clearance.
+    -- The turtle goes down, moves forward far enough to clear the protected block,
+    -- then comes back up only after it is past the obstruction.
+    if h==2 then
+      for forwardDist=2,BYPASS_LIMIT do
+        if shouldInterruptMovement() then return false end
+        if tryBypassPath(join({"D"},repeatAction("F",forwardDist),{"U"}),"UNDER_"..forwardDist,routeReason) then return true end
+      end
     end
-  end
 
-  -- Side bypasses expand outward and forward from the problem point.
-  -- Pattern: sidestep N, move forward M, return to the original line, then continue.
-  -- This fixes the monitor/chest case where a 1-wide sidestep or 2-forward jog is not enough.
-  for sideDist=1,BYPASS_LIMIT do
-    for forwardDist=2,BYPASS_LIMIT do
-      if shouldInterruptMovement() then return false end
-      local leftPath = join({"L"},repeatAction("F",sideDist),{"R"},repeatAction("F",forwardDist),{"R"},repeatAction("F",sideDist),{"L"})
-      if tryBypassPath(leftPath,"LEFT_"..sideDist.."_"..forwardDist) then return true end
-      if shouldInterruptMovement() then return false end
-      local rightPath = join({"R"},repeatAction("F",sideDist),{"L"},repeatAction("F",forwardDist),{"L"},repeatAction("F",sideDist),{"R"})
-      if tryBypassPath(rightPath,"RIGHT_"..sideDist.."_"..forwardDist) then return true end
+    -- Height >=3: try over-routes with increasing forward clearance.
+    -- It must move over AND past the protected block before descending.
+    if h>=3 then
+      for forwardDist=2,BYPASS_LIMIT do
+        if shouldInterruptMovement() then return false end
+        if tryBypassPath(join({"U"},repeatAction("F",forwardDist),{"D"}),"OVER_"..forwardDist,routeReason) then return true end
+      end
     end
+
+    -- Side bypasses expand outward and forward from the problem point.
+    -- Pattern: sidestep N, move forward M, return to the original line, then continue.
+    -- This fixes the monitor/chest case where a 1-wide sidestep or 2-forward jog is not enough.
+    if trySideBypass() then return true end
   end
 
   local tries = bumpProblemRetry(name)
-  report("BYPASS_RETRY",{name=name,pos=copy(state.pos),taskId=state.task and state.task.id,attempt=tries,limit=3})
+  report("BYPASS_RETRY",{name=name,pos=copy(state.pos),taskId=state.task and state.task.id,attempt=tries,limit=3,routeReason=reason,routePhase=state.routePhase})
 
   -- First two failures on the same obstruction return to origin and retry the same path.
   -- Third failure marks the task/quadrant as Problem so the controller can skip it and assign the next task.
-  if tries < 3 and state.job and state.task then
+  if tries < 3 and state.job and state.task and not transitBypass then
     pcall(function() returnToOrigin() end)
     return false
   end
 
-  return reportProblem("Unable to bypass protected/ignored block after 3 origin retries: "..tostring(name),{name=name,limit=BYPASS_LIMIT,attempts=tries})
+  return reportProblem("Unable to bypass protected/ignored block after 3 origin retries: "..tostring(name),{name=name,limit=BYPASS_LIMIT,attempts=tries,routeReason=reason,routePhase=state.routePhase})
 end
 local function moveChecked(dir, reason) return rawMove(dir, reason, true, true) end
 
