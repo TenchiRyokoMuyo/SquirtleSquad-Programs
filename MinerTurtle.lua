@@ -6,7 +6,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "miner"
-local VERSION = "v2.1-fullpass-transit-waitfix"
+local VERSION = "v2.1-fullpass-gps-racefix"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MinerTurtle"
 local STATE_FILE = DATA_DIR .. "/miner_state.dat"
@@ -36,6 +36,8 @@ local state = {
 }
 
 local modemSide, running, paused = nil, true, false
+local lastAnchorPayload = nil
+local lastAnchorAt = 0
 
 -- ---------- storage / utility ----------
 local function ensureDir() if not fs.exists("SquirtleSquadData") then fs.makeDir("SquirtleSquadData") end if not fs.exists(DATA_DIR) then fs.makeDir(DATA_DIR) end end
@@ -71,9 +73,59 @@ local function shouldInterruptMovement() return returnRequested or state.rogue e
 
 -- ---------- GPS quorum ----------
 local function locate(timeout) local x,y,z = gps.locate(timeout or 2); if x then return {x=math.floor(x+0.5),y=math.floor(y+0.5),z=math.floor(z+0.5)} end return nil end
-local function requestAnchors() if state.controllerId then send(state.controllerId,{type="ANCHOR_REQUEST",payload={}}) else broadcast({type="ANCHOR_REQUEST",payload={}}) end local deadline=os.clock()+CONTROLLER_TIMEOUT while os.clock()<deadline do local id,msg=rednet.receive(PROTOCOL,1); if id and validPacket(msg) then if msg.type=="ANCHOR_STATUS" then state.controllerId=id; saveState(); return msg.payload elseif msg.type=="REGISTER_ACK" then state.controllerId=id; if msg.payload and msg.payload.protectedRevision and msg.payload.protectedRevision > state.protectedRevision then send(id,{type="PROTECTED_REQUEST",payload={}}) end; saveState(); return msg.payload and msg.payload.anchors elseif msg.type=="PROTECTED_LIST" then -- do not lose useful packet while waiting
-        local pl=msg.payload or {}; state.protectedExact={}; state.protectedContains={}; for _,v in ipairs(pl.exact or {}) do state.protectedExact[string.lower(v)]=true end; for _,v in ipairs(pl.contains or {}) do table.insert(state.protectedContains,string.lower(v)) end; state.protectedRevision=pl.revision or state.protectedRevision; saveTable(PROTECTED_FILE,{exact=state.protectedExact,contains=state.protectedContains,revision=state.protectedRevision})
-      end end end return nil end
+local function requestAnchors()
+  local deadline = os.clock() + CONTROLLER_TIMEOUT
+  local lastRequest = 0
+
+  while os.clock() < deadline do
+    if lastAnchorPayload and (now() - (lastAnchorAt or 0)) < 10000 then
+      return lastAnchorPayload
+    end
+
+    if os.clock() - lastRequest >= 1 then
+      if state.controllerId then
+        send(state.controllerId,{type="ANCHOR_REQUEST",payload={}})
+      else
+        broadcast({type="ANCHOR_REQUEST",payload={}})
+      end
+      lastRequest = os.clock()
+    end
+
+    local id,msg = rednet.receive(PROTOCOL,0.5)
+    if id and validPacket(msg) then
+      if msg.type == "ANCHOR_STATUS" then
+        state.controllerId = id
+        lastAnchorPayload = msg.payload
+        lastAnchorAt = now()
+        saveState()
+        return msg.payload
+      elseif msg.type == "REGISTER_ACK" then
+        state.controllerId = id
+        if msg.payload and msg.payload.protectedRevision and msg.payload.protectedRevision > state.protectedRevision then
+          send(id,{type="PROTECTED_REQUEST",payload={}})
+        end
+        if msg.payload and msg.payload.anchors then
+          lastAnchorPayload = msg.payload.anchors
+          lastAnchorAt = now()
+        end
+        saveState()
+        return msg.payload and msg.payload.anchors
+      elseif msg.type == "PROTECTED_LIST" then
+        local pl=msg.payload or {}
+        state.protectedExact={}
+        state.protectedContains={}
+        for _,v in ipairs(pl.exact or {}) do state.protectedExact[string.lower(v)]=true end
+        for _,v in ipairs(pl.contains or {}) do table.insert(state.protectedContains,string.lower(v)) end
+        state.protectedRevision=pl.revision or state.protectedRevision
+        saveTable(PROTECTED_FILE,{exact=state.protectedExact,contains=state.protectedContains,revision=state.protectedRevision})
+      elseif handlePacket then
+        handlePacket(id,msg)
+      end
+    end
+  end
+  return nil
+end
+
 local function gpsQuorum() local p=locate(2); state.gpsValid=false; if not p then saveState(); return false,"gps.locate failed" end local a=requestAnchors(); if not a or not a.ok or (a.gpsSubhosts or 0)<3 then state.pos=p; saveState(); return false,"4 GPS anchors unavailable" end state.pos=p; state.lastSafePos=copy(p); state.gpsValid=true; state.atHome=samePos(state.pos,state.home); saveState(); return true end
 local function gpsCheck(force) if not force and (state.movesSinceGps or 0) < GPS_CHECK_MOVES then return true end state.movesSinceGps=0; local ok,why=gpsQuorum(); if not ok then report("GPS_LOST",{reason=why,pos=copy(state.pos),lastSafePos=copy(state.lastSafePos)}); state.status="GPS_LOST"; saveState(); return false end return true end
 
@@ -447,7 +499,17 @@ function goZ(z, reason)
   return true
 end
 function goTo(p, reason)
-  if not gpsCheck(true) then return false end
+  if not gpsCheck(true) then
+    state.status = "WAITING_GPS"
+    saveState(); heartbeat()
+    local gpsDeadline = os.clock() + 30
+    while os.clock() < gpsDeadline do
+      if gpsCheck(true) then break end
+      sleep(1)
+      if shouldInterruptMovement() then return false end
+    end
+    if not state.gpsValid then return false end
+  end
   if not p then return false end
 
   -- Home -> origin special case:
@@ -675,6 +737,7 @@ function handlePacket(id,msg)
   if not validPacket(msg) then return end
   if msg.type=="REGISTER_ACK" then state.controllerId=id; if msg.payload and msg.payload.killSwitch and msg.payload.killSwitch.active then emergencyReturn("Controller kill switch active on register") end; if msg.payload and msg.payload.protectedRevision and msg.payload.protectedRevision>state.protectedRevision then send(id,{type="PROTECTED_REQUEST",payload={}}) end; saveState()
   elseif msg.type=="PROTECTED_LIST" then state.controllerId=id; loadProtected(msg.payload)
+  elseif msg.type=="ANCHOR_STATUS" then state.controllerId=id; lastAnchorPayload=msg.payload; lastAnchorAt=now(); saveState()
   elseif msg.type=="ROLL_CALL" then heartbeat()
   elseif msg.type=="PAUSE_JOB" then paused=true; state.status="PAUSED"; saveState(); heartbeat()
   elseif msg.type=="RESUME_JOB" then paused=false; state.status="IDLE"; saveState(); heartbeat()
