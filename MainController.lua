@@ -3,7 +3,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "controller"
-local VERSION = "v2.1-field-reassign"
+local VERSION = "v2.1-field-reassign-queuefix"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MainController"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
