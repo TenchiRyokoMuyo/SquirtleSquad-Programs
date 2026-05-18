@@ -316,13 +316,6 @@ local function expandBounds(b, n)
   return { minX=b.minX-n, maxX=b.maxX+n, minY=b.minY-n, maxY=b.maxY+n, minZ=b.minZ-n, maxZ=b.maxZ+n }
 end
 
-local function inBox(b, p)
-  return b and p
-    and p.x >= b.minX and p.x <= b.maxX
-    and p.y >= b.minY and p.y <= b.maxY
-    and p.z >= b.minZ and p.z <= b.maxZ
-end
-
 local function shapeBounds(job)
   local h = math.max(1, tonumber(job.layerHeight) or 1)
   if job.shape == "cuboid_center" then
@@ -443,6 +436,18 @@ local function minerIsInsideJob(job, a)
   return inBox(b, a.pos)
 end
 
+
+local function minerHasActiveTask(minerId)
+  for _, job in pairs(state.jobs or {}) do
+    for _, task in ipairs(job.tasks or {}) do
+      if task.minerId == minerId and task.status == "IN_PROGRESS" then
+        return true, task, job
+      end
+    end
+  end
+  return false, nil, nil
+end
+
 local function minerReferencePos(a, job)
   -- For initial deployment, prefer home so the first turtle nearest the job
   -- origin leaves first. Once a turtle is already in the job area, prefer its
@@ -465,6 +470,7 @@ local function availableMiners(job)
   for id, a in pairs(state.agents) do
     if a.role == "miner"
       and agentIsOnline(a)
+      and not minerHasActiveTask(id)
       and a.status ~= "ROGUE"
       and a.status ~= "ASSIGNED"
       and a.status ~= "MOVING_TO_ORIGIN"
@@ -596,48 +602,40 @@ local function assignTasks()
   promoteQueuedJobs()
   cleanupJobLists()
 
-  -- The transit queue now controls home <-> origin traffic, so the controller
-  -- should assign every currently available miner to a queued task. Miners that
-  -- need to leave home will line up through TRANSIT_LOCK_REQUEST instead of
-  -- all physically moving at once.
   local changed = false
 
   for _, jobId in ipairs(state.activeJobs) do
     local job = state.jobs[jobId]
     if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
-      local miners = availableMiners(job)
-      local minerIndex = 1
-
-      while minerIndex <= #miners do
+      while true do
         local task = firstQueuedTask(job)
         if not task then break end
 
-        local m = miners[minerIndex]
-        minerIndex = minerIndex + 1
+        local miners = availableMiners(job)
+        if #miners == 0 then break end
 
-        if m and m.id and state.agents[m.id] then
-          task.status = "IN_PROGRESS"
-          task.minerId = m.id
-          task.startedAt = now()
-          task.originReached = false
-          task.originReachedAt = nil
+        local m = miners[1]
+        task.status = "IN_PROGRESS"
+        task.minerId = m.id
+        task.startedAt = now()
+        task.originReached = false
+        task.originReachedAt = nil
 
-          state.agents[m.id].status = "ASSIGNED"
-          state.agents[m.id].assignedTask = task.id
+        state.agents[m.id].status = "ASSIGNED"
+        state.agents[m.id].assignedTask = task.id
 
-          send(m.id, {
-            type="TASK_ASSIGN",
-            payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision }
-          })
+        send(m.id, {
+          type="TASK_ASSIGN",
+          payload={ job=compactJob(job), task=copy(task), protectedRevision=state.protected.revision }
+        })
 
-          log("Assigned " .. task.id .. " to miner " .. tostring(m.id) .. " dist=" .. string.format("%.1f", m.originDistance or 0))
-          changed = true
-        end
+        log("Assigned " .. task.id .. " to miner " .. tostring(m.id) .. " dist=" .. string.format("%.1f", m.originDistance or 0))
+        changed = true
       end
     end
   end
 
-  if changed then saveState() else saveState() end
+  saveState()
 end
 
 local function checkJobCompletion(job)
@@ -889,7 +887,6 @@ local function handlePacket(id, p)
           task.originReachedAt = now()
           log("Miner " .. tostring(id) .. " reached origin for " .. tostring(task.id))
           saveState()
-          assignTasks()
           return
         end
       end
