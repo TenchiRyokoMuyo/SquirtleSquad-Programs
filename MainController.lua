@@ -755,18 +755,26 @@ releaseMinerOriginLocks = function(minerId)
 end
 
 local function handleOriginLockRequest(id, p)
+  -- Origin locks used to serialize home -> origin deployment. That is now handled
+  -- by the global transit queue. Keep this request/response path for miner
+  -- compatibility, but do not block additional assigned miners here.
   state.originLocks = state.originLocks or {}
   local pl = p.payload or {}
-  local key = originLockKey(pl.jobId)
-  local existing = state.originLocks[key]
-  if not existing or existing.minerId == id or (now() - (existing.startedAt or 0)) > 120000 then
-    state.originLocks[key] = { minerId = id, taskId = pl.taskId, lockId = pl.lockId, startedAt = now(), pos = pl.pos }
-    if state.agents[id] then state.agents[id].status = "MOVING_TO_ORIGIN" end
-    send(id, { type="ORIGIN_LOCK_GRANTED", payload={ jobId=pl.jobId, taskId=pl.taskId, lockId=pl.lockId } })
-    log("Origin lock granted to " .. tostring(id) .. " for " .. tostring(pl.jobId))
-  else
-    send(id, { type="ORIGIN_LOCK_DENIED", payload={ jobId=pl.jobId, taskId=pl.taskId, lockId=pl.lockId, holder=existing.minerId } })
-  end
+  local key = originLockKey(pl.jobId) .. ":" .. tostring(id) .. ":" .. tostring(pl.taskId or "")
+  state.originLocks[key] = {
+    minerId = id,
+    taskId = pl.taskId,
+    lockId = pl.lockId,
+    startedAt = now(),
+    pos = pl.pos
+  }
+
+  send(id, {
+    type="ORIGIN_LOCK_GRANTED",
+    payload={ jobId=pl.jobId, taskId=pl.taskId, lockId=pl.lockId }
+  })
+
+  log("Origin movement acknowledged for miner " .. tostring(id) .. " task " .. tostring(pl.taskId))
   saveState()
 end
 
