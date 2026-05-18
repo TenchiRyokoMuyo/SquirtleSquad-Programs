@@ -3,7 +3,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "controller"
-local VERSION = "v2.1-origin-sequence"
+local VERSION = "v2.1-field-reassign"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MainController"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
@@ -427,20 +427,32 @@ local function agentIsOnline(a)
   return a and (now() - (a.lastSeen or 0)) <= AGENT_TIMEOUT * 1000
 end
 
-local function minerReferencePos(a)
-  -- Prefer the miner's saved home for startup ordering because the miner is
-  -- expected to begin jobs from home. Fall back to live position if needed.
-  return a and (a.home or a.pos)
+local function minerIsInsideJob(job, a)
+  if not job or not a or not a.pos or not job.fullBounds then return false end
+  -- A miner that just completed a task may be waiting at the origin/work area
+  -- instead of at home. It should be eligible for the next pass/task without
+  -- forcing a return through the home corridor.
+  local b = expandBounds(job.fullBounds, 2)
+  return inBox(b, a.pos)
 end
 
-local function minerDistanceToOrigin(a, jobOrigin)
-  if not jobOrigin then return 999999 end
-  local p = minerReferencePos(a)
+local function minerReferencePos(a, job)
+  -- For initial deployment, prefer home so the first turtle nearest the job
+  -- origin leaves first. Once a turtle is already in the job area, prefer its
+  -- live position so completed miners can immediately take the next pass.
+  if not a then return nil end
+  if job and minerIsInsideJob(job, a) then return a.pos end
+  return a.home or a.pos
+end
+
+local function minerDistanceToOrigin(a, job)
+  if not job or not job.origin then return 999999 end
+  local p = minerReferencePos(a, job)
   if not p then return 999999 end
-  return distance(p, jobOrigin)
+  return distance(p, job.origin)
 end
 
-local function availableMiners(jobOrigin)
+local function availableMiners(job)
   local out = {}
   local ctrlPos = state.gps.x and {x=state.gps.x,y=state.gps.y,z=state.gps.z} or nil
   for id, a in pairs(state.agents) do
@@ -449,23 +461,34 @@ local function availableMiners(jobOrigin)
       and a.status ~= "ROGUE"
       and a.status ~= "ASSIGNED"
       and a.status ~= "MOVING_TO_ORIGIN"
-      and a.status ~= "AT_ORIGIN"
       and a.status ~= "WORKING"
       and a.status ~= "RETURNING"
-      and a.status ~= "RETURN_REQUESTED" then
-      if a.homeValid and a.inventoryValid and a.gpsValid and a.atHome then
-        local ref = minerReferencePos(a)
-        if not ctrlPos or not ref or distance(ctrlPos, ref) <= MINER_HOME_RANGE then
-          table.insert(out, {
-            id = id,
-            agent = a,
-            originDistance = minerDistanceToOrigin(a, jobOrigin),
-          })
+      and a.status ~= "RETURN_REQUESTED"
+      and a.status ~= "PROBLEM" then
+      if a.homeValid and a.inventoryValid and a.gpsValid then
+        local inField = minerIsInsideJob(job, a)
+        local atHome = a.atHome == true
+        -- At job start, only home-ready miners are released into the transit
+        -- queue. After a pass completes, miners already inside the job volume
+        -- are allowed to accept the next queued task/pass from where they are.
+        if atHome or inField then
+          local ref = minerReferencePos(a, job)
+          if inField or not ctrlPos or not ref or distance(ctrlPos, ref) <= MINER_HOME_RANGE then
+            table.insert(out, {
+              id = id,
+              agent = a,
+              inField = inField,
+              originDistance = minerDistanceToOrigin(a, job),
+            })
+          end
         end
       end
     end
   end
   table.sort(out, function(a,b)
+    -- Prefer miners already in the work area for follow-up passes/tasks so they
+    -- do not unnecessarily return home and re-enter the transit queue.
+    if a.inField ~= b.inField then return a.inField and not b.inField end
     if a.originDistance ~= b.originDistance then
       return a.originDistance < b.originDistance
     end
@@ -579,7 +602,7 @@ local function assignTasks()
         return
       end
 
-      local miners = availableMiners(job.origin)
+      local miners = availableMiners(job)
       if #miners == 0 then return end
 
       local m = miners[1]
@@ -657,6 +680,10 @@ local function markTaskByMiner(minerId, status, problem)
         if releaseMinerTransitLocks then releaseMinerTransitLocks(minerId) end
         checkJobCompletion(job)
         saveState()
+        -- If more queued tasks/passes remain, immediately release another task.
+        -- This prevents miners that completed a pass from sitting IDLE at the
+        -- work area while the controller waits for home-ready miners only.
+        assignTasks()
         return true
       end
     end
