@@ -3,7 +3,7 @@
 
 local PROJECT = "SquirtleSquad-Miner"
 local ROLE = "controller"
-local VERSION = "v2.1-field-reassign"
+local VERSION = "v2.1-transit-priority"
 local PROTOCOL = "TurtleTeamNet"
 local DATA_DIR = "SquirtleSquadData/MainController"
 local STATE_FILE = DATA_DIR .. "/controller_state.dat"
@@ -54,6 +54,7 @@ local function defaultState()
     killSwitch = { active = false, id = nil, startedAt = nil },
     originLocks = {},
     transitLock = { holder = nil, queue = {} },
+    schedulerSeq = 0,
   }
   return s
 end
@@ -648,6 +649,9 @@ local function assignTasks()
           task.startedAt = now()
           task.originReached = false
           task.originReachedAt = nil
+          state.schedulerSeq = (state.schedulerSeq or 0) + 1
+          task.transitPriority = state.schedulerSeq
+          task.assignedDistance = chosen.originDistance
 
           state.agents[chosen.id].status = "ASSIGNED"
           state.agents[chosen.id].assignedTask = task.id
@@ -780,15 +784,88 @@ end
 
 -- Global transit queue for home <-> origin traffic.
 -- This prevents turtles from crowding the rack/origin corridor.
+local function findTask(jobId, taskId)
+  if not jobId or not taskId then return nil, nil end
+  local job = state.jobs and state.jobs[jobId]
+  if not job then return nil, nil end
+  for _, task in ipairs(job.tasks or {}) do
+    if task.id == taskId then return job, task end
+  end
+  return nil, nil
+end
+
+local function taskTransitPriority(job, task)
+  if not task then return 999999999 end
+  if task.transitPriority then return task.transitPriority end
+  if task.startedAt then return task.startedAt end
+  return 999999999
+end
+
+local function entryTransitPriority(e)
+  if not e then return 999999999 end
+  if e.priority then return e.priority end
+  local job, task = findTask(e.jobId, e.taskId)
+  if task then return taskTransitPriority(job, task) end
+  return e.requestedAt or 999999999
+end
+
+local function firstOutstandingOriginTransit()
+  local best = nil
+  for _, jobId in ipairs(state.activeJobs or {}) do
+    local job = state.jobs[jobId]
+    if job and job.status ~= "PAUSED" and job.status ~= "CANCELLED" then
+      for _, task in ipairs(job.tasks or {}) do
+        if task.status == "IN_PROGRESS" and task.minerId and not task.originReached then
+          local a = state.agents[task.minerId]
+          if a and agentIsOnline(a) and a.status ~= "PROBLEM" and a.status ~= "ROGUE" then
+            local pr = taskTransitPriority(job, task)
+            if not best or pr < best.priority or (pr == best.priority and tostring(task.minerId) < tostring(best.minerId)) then
+              best = { minerId = task.minerId, taskId = task.id, jobId = job.id, priority = pr }
+            end
+          end
+        end
+      end
+    end
+  end
+  return best
+end
+
+local function canGrantTransitEntry(e)
+  if not e or not e.minerId then return false end
+  if not state.agents[e.minerId] or not agentIsOnline(state.agents[e.minerId]) then return false end
+  if e.purpose == "to_origin" then
+    local best = firstOutstandingOriginTransit()
+    if best then
+      return tostring(e.minerId) == tostring(best.minerId) and tostring(e.taskId) == tostring(best.taskId)
+    end
+  end
+  return true
+end
+
+-- Global transit queue for home <-> origin traffic.
+-- This prevents turtles from crowding the rack/origin corridor.
 local function cleanTransitQueue()
   state.transitLock = state.transitLock or { holder = nil, queue = {} }
   state.transitLock.queue = state.transitLock.queue or {}
+  local seen = {}
   local q = {}
   for _, e in ipairs(state.transitLock.queue) do
     if e and e.minerId and state.agents[e.minerId] and agentIsOnline(state.agents[e.minerId]) then
-      table.insert(q, e)
+      local key = tostring(e.minerId) .. ":" .. tostring(e.lockId or "")
+      if not seen[key] then
+        seen[key] = true
+        e.priority = entryTransitPriority(e)
+        table.insert(q, e)
+      end
     end
   end
+  table.sort(q, function(a,b)
+    local ap, bp = entryTransitPriority(a), entryTransitPriority(b)
+    if ap ~= bp then return ap < bp end
+    local ar, br = a.requestedAt or 0, b.requestedAt or 0
+    if ar ~= br then return ar < br end
+    return tostring(a.minerId) < tostring(b.minerId)
+  end)
   state.transitLock.queue = q
 end
 
@@ -810,6 +887,7 @@ local function grantTransitLock(e)
     taskId = e.taskId,
     startedAt = now(),
     pos = e.pos,
+    priority = entryTransitPriority(e),
   }
   if state.agents[e.minerId] then
     state.agents[e.minerId].status = e.purpose == "to_home" and "RETURNING" or "MOVING_TO_ORIGIN"
@@ -822,9 +900,9 @@ local function promoteTransitLock()
   state.transitLock = state.transitLock or { holder = nil, queue = {} }
   if state.transitLock.holder then return end
   cleanTransitQueue()
-  while #state.transitLock.queue > 0 do
-    local e = table.remove(state.transitLock.queue, 1)
-    if e and e.minerId and state.agents[e.minerId] and agentIsOnline(state.agents[e.minerId]) then
+  for i, e in ipairs(state.transitLock.queue) do
+    if canGrantTransitEntry(e) then
+      table.remove(state.transitLock.queue, i)
       grantTransitLock(e)
       saveState()
       return
@@ -854,22 +932,44 @@ local function handleTransitLockRequest(id, p)
     state.transitLock.holder = nil
     holder = nil
   end
-  local entry = { minerId=id, lockId=pl.lockId or (tostring(id)..":"..tostring(now())), purpose=pl.purpose or "transit", jobId=pl.jobId, taskId=pl.taskId, requestedAt=now(), pos=pl.pos }
+
   if holder and holder.minerId == id then
     send(id, { type="TRANSIT_LOCK_GRANTED", payload={ lockId=holder.lockId, purpose=holder.purpose, jobId=holder.jobId, taskId=holder.taskId } })
     return
   end
-  if not state.transitLock.holder then
-    grantTransitLock(entry)
+
+  local entry = {
+    minerId=id,
+    lockId=pl.lockId or (tostring(id)..":"..tostring(now())),
+    purpose=pl.purpose or "transit",
+    jobId=pl.jobId,
+    taskId=pl.taskId,
+    requestedAt=now(),
+    pos=pl.pos,
+  }
+  entry.priority = entryTransitPriority(entry)
+
+  cleanTransitQueue()
+  local idx = transitQueueIndex(id, entry.lockId)
+  if idx then
+    state.transitLock.queue[idx] = entry
   else
-    local idx = transitQueueIndex(id, entry.lockId)
-    if not idx then
-      table.insert(state.transitLock.queue, entry)
-      idx = #state.transitLock.queue
-      log("Transit queued " .. tostring(id) .. " (" .. tostring(entry.purpose) .. ") pos " .. tostring(idx))
+    -- Remove stale queued locks from this miner before adding its newest request.
+    for i = #state.transitLock.queue, 1, -1 do
+      if state.transitLock.queue[i].minerId == id then table.remove(state.transitLock.queue, i) end
     end
-    send(id, { type="TRANSIT_LOCK_WAIT", payload={ lockId=entry.lockId, purpose=entry.purpose, position=idx, holder=state.transitLock.holder and state.transitLock.holder.minerId } })
+    table.insert(state.transitLock.queue, entry)
+    log("Transit queued " .. tostring(id) .. " (" .. tostring(entry.purpose) .. ") priority " .. tostring(entry.priority))
   end
+
+  promoteTransitLock()
+
+  if state.transitLock.holder and state.transitLock.holder.minerId == id then
+    return
+  end
+
+  local pos = transitQueueIndex(id, entry.lockId) or 0
+  send(id, { type="TRANSIT_LOCK_WAIT", payload={ lockId=entry.lockId, purpose=entry.purpose, position=pos, holder=state.transitLock.holder and state.transitLock.holder.minerId } })
   saveState()
 end
 
@@ -922,6 +1022,7 @@ local function handlePacket(id, p)
           task.originReachedAt = now()
           log("Miner " .. tostring(id) .. " reached origin for " .. tostring(task.id))
           saveState()
+          promoteTransitLock()
           assignTasks()
           return
         end
